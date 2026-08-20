@@ -97,6 +97,56 @@ ENTERPRISE_CSS = """
     .sub-amber { color: #F59E0B; }
     .sub-red { color: #EF4444; }
 
+    /* Enhanced Prominent Loaders & Status Elements */
+    .stSpinner {
+        text-align: center;
+        padding: 18px 0;
+    }
+    .stSpinner > div {
+        border-top-color: #38BDF8 !important;
+        border-right-color: #818CF8 !important;
+        border-bottom-color: #A855F7 !important;
+        animation: spinGlow 0.75s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
+    .stSpinner span {
+        font-family: 'Outfit', sans-serif !important;
+        font-size: 1.0rem !important;
+        font-weight: 600 !important;
+        color: #38BDF8 !important;
+        letter-spacing: 0.02em !important;
+        margin-left: 10px;
+    }
+    @keyframes spinGlow {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+
+    /* Status Pill Badges */
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        background: rgba(56, 189, 248, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        border-radius: 9999px;
+        padding: 5px 14px;
+        font-size: 0.80rem;
+        font-weight: 600;
+        color: #38BDF8;
+    }
+    .pulse-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background-color: #10B981;
+        box-shadow: 0 0 8px #10B981;
+        animation: pulseAnimation 1.5s infinite;
+    }
+    @keyframes pulseAnimation {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
     /* Action Playbook Cards */
     .playbook-box {
         border-radius: 14px;
@@ -376,13 +426,21 @@ with st.sidebar:
 # -------------------------------------------------------------------------------------------------
 # Core Processing Pipeline (RFM-T, CLV, ML, Cohorts)
 # -------------------------------------------------------------------------------------------------
-try:
-    clean_tx, rfmt_df = cached_process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
-    clv_df = cached_estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
-    rfmt_ml, pca_model, exp_var = cached_compute_pca_3d(clv_df)
-except Exception as e:
-    st.error(f"Error processing transaction dataset: {e}")
-    st.stop()
+with st.spinner(f"⚡ Processing '{data_source_label}' & calculating RFM-T Customer Intelligence..."):
+    try:
+        clean_tx, rfmt_df = cached_process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
+        clv_df = cached_estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
+        rfmt_ml, pca_model, exp_var = cached_compute_pca_3d(clv_df)
+    except Exception as e:
+        st.error(f"Error processing transaction dataset: {e}")
+        st.stop()
+
+
+# Detect parameter changes and trigger real-time feedback toast
+active_state_sig = f"{data_source_label}#{snapshot_date}#{col_cust}#{col_date}#{col_spend}"
+if "prev_state_sig" in st.session_state and st.session_state["prev_state_sig"] != active_state_sig:
+    st.toast(f"Intelligence refreshed: {len(rfmt_df):,} customers loaded from {data_source_label}", icon="🎯")
+st.session_state["prev_state_sig"] = active_state_sig
 
 
 # -------------------------------------------------------------------------------------------------
@@ -393,10 +451,16 @@ hdr_left, hdr_right = st.columns([3, 1])
 with hdr_left:
     st.title("🎯 Customer RFM-T & AI Intelligence Platform")
     st.markdown(
-        f"**Dataset:** `{data_source_label}` &nbsp;|&nbsp; "
-        f"**Snapshot Date:** `{snapshot_date}` &nbsp;|&nbsp; "
-        f"**Customers:** `{len(rfmt_df):,}` &nbsp;|&nbsp; "
-        f"**Transactions:** `{len(clean_tx):,}`"
+        f"""
+        <div style='display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top: -6px;'>
+            <span class='status-badge'><span class='pulse-dot'></span> Live AI Engine Active</span>
+            <span style='color:#94A3B8; font-size:0.88rem;'><strong>Source:</strong> <code>{data_source_label}</code></span>
+            <span style='color:#94A3B8; font-size:0.88rem;'><strong>Snapshot:</strong> <code>{snapshot_date}</code></span>
+            <span style='color:#94A3B8; font-size:0.88rem;'><strong>Customers:</strong> <strong style='color:#F8FAFC;'>{len(rfmt_df):,}</strong></span>
+            <span style='color:#94A3B8; font-size:0.88rem;'><strong>Transactions:</strong> <strong style='color:#F8FAFC;'>{len(clean_tx):,}</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
 with hdr_right:
@@ -453,39 +517,40 @@ with tab1:
     st.subheader("📈 Month-over-Month Acquisition Cohort Retention")
     st.caption("Track retention decay dynamics across monthly customer acquisition cohorts over a 24-month horizon.")
 
-    try:
-        count_matrix, retention_matrix, cohort_sizes = cached_compute_monthly_cohort_matrix(clean_tx)
-        
-        c_left, c_right = st.columns([2, 1])
-        with c_left:
-            fig_cohort = create_cohort_retention_heatmap(retention_matrix, count_matrix)
-            st.plotly_chart(fig_cohort, use_container_width=True)
+    with st.spinner("📈 Analyzing monthly acquisition cohorts & computing retention triangle matrix..."):
+        try:
+            count_matrix, retention_matrix, cohort_sizes = cached_compute_monthly_cohort_matrix(clean_tx)
             
-        with c_right:
-            fig_curve = create_average_retention_curve(retention_matrix)
-            st.plotly_chart(fig_curve, use_container_width=True)
-            
-            # Retention Health Check
-            m1_ret = retention_matrix.mean().get(1, 0)
-            m3_ret = retention_matrix.mean().get(3, 0)
-            m6_ret = retention_matrix.mean().get(6, 0)
-            
-            st.markdown(
-                f"""
-                <div class="kpi-container" style="margin-top: 10px;">
-                    <div class="kpi-label">Retention Benchmarks</div>
-                    <div style="font-size: 0.90rem; line-height: 1.8; color: #E2E8F0;">
-                        <div>⚡ <strong>Month 1 Retention:</strong> <span class="sub-green">{m1_ret:.1f}%</span></div>
-                        <div>⚡ <strong>Month 3 Retention:</strong> <span class="sub-blue">{m3_ret:.1f}%</span></div>
-                        <div>⚡ <strong>Month 6 Retention:</strong> <span class="sub-amber">{m6_ret:.1f}%</span></div>
+            c_left, c_right = st.columns([2, 1])
+            with c_left:
+                fig_cohort = create_cohort_retention_heatmap(retention_matrix, count_matrix)
+                st.plotly_chart(fig_cohort, use_container_width=True)
+                
+            with c_right:
+                fig_curve = create_average_retention_curve(retention_matrix)
+                st.plotly_chart(fig_curve, use_container_width=True)
+                
+                # Retention Health Check
+                m1_ret = retention_matrix.mean().get(1, 0)
+                m3_ret = retention_matrix.mean().get(3, 0)
+                m6_ret = retention_matrix.mean().get(6, 0)
+                
+                st.markdown(
+                    f"""
+                    <div class="kpi-container" style="margin-top: 10px;">
+                        <div class="kpi-label">Retention Benchmarks</div>
+                        <div style="font-size: 0.90rem; line-height: 1.8; color: #E2E8F0;">
+                            <div>⚡ <strong>Month 1 Retention:</strong> <span class="sub-green">{m1_ret:.1f}%</span></div>
+                            <div>⚡ <strong>Month 3 Retention:</strong> <span class="sub-blue">{m3_ret:.1f}%</span></div>
+                            <div>⚡ <strong>Month 6 Retention:</strong> <span class="sub-amber">{m6_ret:.1f}%</span></div>
+                        </div>
                     </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            
-    except Exception as err:
-        st.warning(f"Unable to render cohort matrix: {err}")
+                    """,
+                    unsafe_allow_html=True
+                )
+                
+        except Exception as err:
+            st.warning(f"Unable to render cohort matrix: {err}")
 
 
 # -------------------------------------------------------------------------------------------------
@@ -563,10 +628,11 @@ with tab3:
     st.subheader("🤖 Unsupervised Machine Learning (K-Means & PCA 3D)")
     st.caption("Normalized feature space ($\log(1+x)$ + StandardScaler) with dynamic Silhouette Optimization and 3D PCA projection.")
 
-    # Evaluate k=2 to k=7
-    X_scaled, _, _ = cached_compute_pca_3d(clv_df)
-    eval_df = cached_evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
-    optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
+    # Evaluate k=2 to k=7 with spinner
+    with st.spinner("🤖 Optimizing cluster partitions across k=2...7 via Silhouette scoring..."):
+        X_scaled, _, _ = cached_compute_pca_3d(clv_df)
+        eval_df = cached_evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
+        optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
 
     c_sel, c_opt = st.columns([2, 1])
     with c_sel:
@@ -583,9 +649,10 @@ with tab3:
             unsafe_allow_html=True
         )
 
-    # Perform clustering
-    df_clustered, km_model, cluster_summary = cached_perform_kmeans_clustering(clv_df, n_clusters=selected_k)
-    df_clustered, _, exp_variance = cached_compute_pca_3d(df_clustered)
+    # Perform clustering with spinner
+    with st.spinner(f"🤖 Fitting K-Means (k={selected_k}) & calculating 3D PCA coordinates..."):
+        df_clustered, km_model, cluster_summary = cached_perform_kmeans_clustering(clv_df, n_clusters=selected_k)
+        df_clustered, _, exp_variance = cached_compute_pca_3d(df_clustered)
 
     col_sil, col_elbow = st.columns([1, 1])
     with col_sil:
@@ -665,62 +732,63 @@ with tab4:
     st.subheader("🔮 Probabilistic BTYD CLV & Real-Time Churn Radar")
     st.caption("Continuous-time Buy-Till-You-Die (BTYD) P(Alive) estimation and 90-day forward value projection.")
 
-    # Churn Tier Summary
-    churn_counts = clv_df["Churn_Risk_Tier"].value_counts()
-    c_low = churn_counts.get("🟢 Low Churn Risk", 0)
-    c_mod = churn_counts.get("🟡 Moderate Watch", 0)
-    c_high = churn_counts.get("🔴 High Churn Risk", 0)
+    with st.spinner("🔮 Calculating active probabilities P(Alive) & churn risks..."):
+        # Churn Tier Summary
+        churn_counts = clv_df["Churn_Risk_Tier"].value_counts()
+        c_low = churn_counts.get("🟢 Low Churn Risk", 0)
+        c_mod = churn_counts.get("🟡 Moderate Watch", 0)
+        c_high = churn_counts.get("🔴 High Churn Risk", 0)
 
-    ct1, ct2, ct3 = st.columns(3)
-    with ct1:
-        render_kpi("Low Churn Risk", f"{c_low:,}", f"{c_low/total_custs*100:.1f}% healthy customers (P(Alive) ≥ 75%)", "green")
-    with ct2:
-        render_kpi("Moderate Watch", f"{c_mod:,}", f"{c_mod/total_custs*100:.1f}% showing decay (45% ≤ P(Alive) < 75%)", "amber")
-    with ct3:
-        render_kpi("High Churn Risk", f"{c_high:,}", f"{c_high/total_custs*100:.1f}% critical danger (P(Alive) < 45%)", "red")
+        ct1, ct2, ct3 = st.columns(3)
+        with ct1:
+            render_kpi("Low Churn Risk", f"{c_low:,}", f"{c_low/total_custs*100:.1f}% healthy customers (P(Alive) ≥ 75%)", "green")
+        with ct2:
+            render_kpi("Moderate Watch", f"{c_mod:,}", f"{c_mod/total_custs*100:.1f}% showing decay (45% ≤ P(Alive) < 75%)", "amber")
+        with ct3:
+            render_kpi("High Churn Risk", f"{c_high:,}", f"{c_high/total_custs*100:.1f}% critical danger (P(Alive) < 45%)", "red")
 
-    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    col_pdist, col_scatter_clv = st.columns([1, 1])
+        col_pdist, col_scatter_clv = st.columns([1, 1])
 
-    with col_pdist:
-        fig_p_alive = px.histogram(
-            clv_df,
-            x="P_Alive_Pct",
-            nbins=30,
-            color="Churn_Risk_Tier",
-            color_discrete_map={
-                "🟢 Low Churn Risk": "#10B981",
-                "🟡 Moderate Watch": "#F59E0B",
-                "🔴 High Churn Risk": "#EF4444"
-            },
-            title="<b>P(Alive) Customer Active Probability Distribution</b>",
-            template="plotly_dark",
-            labels={"P_Alive_Pct": "P(Alive) %"}
-        )
-        fig_p_alive.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig_p_alive, use_container_width=True)
+        with col_pdist:
+            fig_p_alive = px.histogram(
+                clv_df,
+                x="P_Alive_Pct",
+                nbins=30,
+                color="Churn_Risk_Tier",
+                color_discrete_map={
+                    "🟢 Low Churn Risk": "#10B981",
+                    "🟡 Moderate Watch": "#F59E0B",
+                    "🔴 High Churn Risk": "#EF4444"
+                },
+                title="<b>P(Alive) Customer Active Probability Distribution</b>",
+                template="plotly_dark",
+                labels={"P_Alive_Pct": "P(Alive) %"}
+            )
+            fig_p_alive.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_p_alive, use_container_width=True)
 
-    with col_scatter_clv:
-        fig_scatter_clv = px.scatter(
-            clv_df,
-            x="Monetary",
-            y="Predicted_Spend_90d",
-            color="Segment",
-            color_discrete_map=SEGMENT_COLORS,
-            size="P_Alive_Pct",
-            hover_name="CustomerID",
-            hover_data={
-                "P_Alive_Pct": ":.1f%",
-                "Expected_Orders_90d": True,
-                "Predictive_CLV_90d": ":$,.2f"
-            },
-            title="<b>Historical Spend vs. 90-Day Forecasted Revenue</b>",
-            template="plotly_dark",
-            labels={"Monetary": "Historical Spend ($)", "Predicted_Spend_90d": "Predicted 90-Day Spend ($)"}
-        )
-        fig_scatter_clv.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
-        st.plotly_chart(fig_scatter_clv, use_container_width=True)
+        with col_scatter_clv:
+            fig_scatter_clv = px.scatter(
+                clv_df,
+                x="Monetary",
+                y="Predicted_Spend_90d",
+                color="Segment",
+                color_discrete_map=SEGMENT_COLORS,
+                size="P_Alive_Pct",
+                hover_name="CustomerID",
+                hover_data={
+                    "P_Alive_Pct": ":.1f%",
+                    "Expected_Orders_90d": True,
+                    "Predictive_CLV_90d": ":$,.2f"
+                },
+                title="<b>Historical Spend vs. 90-Day Forecasted Revenue</b>",
+                template="plotly_dark",
+                labels={"Monetary": "Historical Spend ($)", "Predicted_Spend_90d": "Predicted 90-Day Spend ($)"}
+            )
+            fig_scatter_clv.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig_scatter_clv, use_container_width=True)
 
     st.markdown("---")
 
@@ -762,6 +830,18 @@ with tab4:
 with tab5:
     st.subheader("💰 'What-If' Marketing Campaign ROI & Action Playbook Simulator")
     st.caption("Simulate expected revenue, incremental margin, net ROI, and payback period across targeted segments.")
+
+    st.markdown(
+        """
+        <div style='margin-bottom: 14px;'>
+            <span class='status-badge'>
+                <span class='pulse-dot'></span> Real-Time ROI Engine Active
+            </span>
+            &nbsp; <span style='font-size:0.84rem; color:#94A3B8;'>Adjust inputs below to simulate instant financial returns.</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     all_segs = list(SEGMENT_PLAYBOOKS.keys())
 
