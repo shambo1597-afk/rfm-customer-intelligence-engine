@@ -174,8 +174,7 @@ def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
 # Sidebar: File Upload, Snapshot Date & Analysis Settings
 # -------------------------------------------------------------------------------------------------
 with st.sidebar:
-    st.image("https://img.icons8.com/isometric/100/bullseye.png", width=60)
-    st.title("Intelligence Hub")
+    st.markdown("## 🎯 Intelligence Hub")
     st.caption("Enterprise RFM-T & Customer Analytics")
 
     st.markdown("---")
