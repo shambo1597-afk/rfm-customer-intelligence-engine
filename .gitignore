@@ -1,0 +1,25 @@
+# Python byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Environment Variables & IDE configs
+.env
+.env.local
+.vscode/
+.idea/
+.DS_Store
+
+# Pytest / Coverage caches
+.pytest_cache/
+.coverage
+htmlcov/

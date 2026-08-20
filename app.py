@@ -1,0 +1,747 @@
+"""
+app.py - Enterprise Customer RFM-T & Customer Intelligence AI Platform
+Multi-tab Streamlit dashboard combining RFM-T Segmentation, Unsupervised K-Means & 3D PCA,
+Probabilistic BTYD CLV & Churn Radar, Cohort Retention Triangle, and What-If Campaign ROI Simulator.
+"""
+
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from src.rfm_engine import (
+    process_rfmt_pipeline,
+    get_segment_kpi_summary,
+    SEGMENT_COLORS,
+    SEGMENT_ICONS,
+    SEGMENT_PLAYBOOKS
+)
+from src.ml_engine import (
+    evaluate_kmeans_candidates,
+    perform_kmeans_clustering,
+    compute_pca_3d
+)
+from src.clv_engine import (
+    estimate_btyd_clv,
+    get_urgent_churn_watchlist,
+    get_top_future_growth_targets
+)
+from src.cohort_engine import (
+    compute_monthly_cohort_matrix,
+    create_cohort_retention_heatmap,
+    create_average_retention_curve
+)
+
+# Configure Streamlit Page
+st.set_page_config(
+    page_title="Enterprise RFM-T & Customer Intelligence Engine",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom Design System (Glassmorphic Dark Styling)
+ENTERPRISE_CSS = """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    h1, h2, h3, h4, h5, h6 {
+        font-family: 'Outfit', sans-serif;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+    }
+
+    /* Modern Glassmorphic KPI Cards */
+    .kpi-container {
+        background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 14px;
+        padding: 16px 20px;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        backdrop-filter: blur(12px);
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .kpi-container:hover {
+        transform: translateY(-2px);
+        border-color: rgba(56, 189, 248, 0.5);
+    }
+    .kpi-label {
+        font-size: 0.78rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #94A3B8;
+        margin-bottom: 4px;
+    }
+    .kpi-value {
+        font-family: 'Outfit', sans-serif;
+        font-size: 1.85rem;
+        font-weight: 800;
+        color: #F8FAFC;
+        line-height: 1.2;
+    }
+    .kpi-sub {
+        font-size: 0.80rem;
+        font-weight: 500;
+        margin-top: 4px;
+    }
+    .sub-green { color: #10B981; }
+    .sub-blue { color: #38BDF8; }
+    .sub-amber { color: #F59E0B; }
+    .sub-red { color: #EF4444; }
+
+    /* Action Playbook Cards */
+    .playbook-box {
+        border-radius: 14px;
+        padding: 22px;
+        margin-bottom: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(15, 23, 42, 0.75);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    /* Simulation Results Banner */
+    .sim-card {
+        background: linear-gradient(135deg, rgba(30, 58, 138, 0.4) 0%, rgba(15, 23, 42, 0.8) 100%);
+        border: 1px solid rgba(59, 130, 246, 0.4);
+        border-radius: 14px;
+        padding: 20px;
+        margin-top: 15px;
+    }
+
+    /* Badges */
+    .badge {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin-right: 6px;
+    }
+
+    /* Streamlit Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 48px;
+        border-radius: 8px 8px 0 0;
+        padding: 10px 18px;
+        font-weight: 600;
+        font-family: 'Outfit', sans-serif;
+    }
+</style>
+"""
+
+st.markdown(ENTERPRISE_CSS, unsafe_allow_html=True)
+
+
+@st.cache_data
+def load_default_transactions():
+    for path in ["data/ecommerce_transactions.csv", "sample_transactions.csv"]:
+        if os.path.exists(path):
+            try:
+                return pd.read_csv(path)
+            except Exception:
+                pass
+    st.error("Default transaction dataset not found. Please upload a CSV.")
+    return pd.DataFrame()
+
+
+def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
+    sub_class = f"sub-{style}"
+    st.markdown(
+        f"""
+        <div class="kpi-container">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value">{value}</div>
+            <div class="kpi-sub {sub_class}">{subtext}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# -------------------------------------------------------------------------------------------------
+# Sidebar: File Upload, Snapshot Date & Analysis Settings
+# -------------------------------------------------------------------------------------------------
+with st.sidebar:
+    st.image("https://img.icons8.com/isometric/100/bullseye.png", width=60)
+    st.title("Intelligence Hub")
+    st.caption("Enterprise RFM-T & Customer Analytics")
+
+    st.markdown("---")
+    st.subheader("📁 Data Source")
+    
+    uploaded_file = st.file_uploader(
+        "Upload Transactions (CSV / XLSX)",
+        type=["csv", "xlsx", "xls"],
+        help="Upload transactional records with CustomerID, PurchaseDate, and Spend/Product details."
+    )
+
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                df_raw = pd.read_csv(uploaded_file)
+            else:
+                df_raw = pd.read_excel(uploaded_file)
+            data_source_label = uploaded_file.name
+            st.success(f"Loaded `{uploaded_file.name}` ({len(df_raw):,} records)")
+        except Exception as e:
+            st.error(f"Error loading file: {e}. Falling back to default data.")
+            df_raw = load_default_transactions()
+            data_source_label = "ecommerce_transactions.csv (Fallback)"
+    else:
+        df_raw = load_default_transactions()
+        data_source_label = "data/ecommerce_transactions.csv"
+        st.info("Using enterprise dataset (`450 Customers / 24 Months`)")
+
+    if df_raw.empty:
+        st.stop()
+
+    st.markdown("---")
+    st.subheader("⚙️ Reference Timeline")
+
+    # Detect max transaction date for snapshot reference
+    df_temp = df_raw.copy()
+    for col in df_temp.columns:
+        if "date" in col.lower() or "time" in col.lower():
+            df_temp[col] = pd.to_datetime(df_temp[col], errors="coerce")
+            max_dt = df_temp[col].max()
+            if pd.notnull(max_dt):
+                default_snapshot = (max_dt + timedelta(days=1)).date()
+                break
+    else:
+        default_snapshot = datetime.now().date()
+
+    use_custom_date = st.checkbox("Custom Snapshot Date", value=False)
+    if use_custom_date:
+        snapshot_date = st.date_input("Analysis Reference Date", value=default_snapshot)
+    else:
+        snapshot_date = default_snapshot
+
+    st.markdown("---")
+    st.caption("AI-Powered Customer Intelligence • Zero External Cost")
+
+
+# -------------------------------------------------------------------------------------------------
+# Core Processing Pipeline (RFM-T, CLV, ML, Cohorts)
+# -------------------------------------------------------------------------------------------------
+try:
+    clean_tx, rfmt_df = process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date)
+    clv_df = estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
+    rfmt_ml, pca_model, exp_var = compute_pca_3d(clv_df)
+except Exception as e:
+    st.error(f"Error processing transaction dataset: {e}")
+    st.stop()
+
+
+# -------------------------------------------------------------------------------------------------
+# Top Executive Header & Global KPI Banner
+# -------------------------------------------------------------------------------------------------
+hdr_left, hdr_right = st.columns([3, 1])
+
+with hdr_left:
+    st.title("🎯 Customer RFM-T & AI Intelligence Platform")
+    st.markdown(
+        f"**Dataset:** `{data_source_label}` &nbsp;|&nbsp; "
+        f"**Snapshot Date:** `{snapshot_date}` &nbsp;|&nbsp; "
+        f"**Customers:** `{len(rfmt_df):,}` &nbsp;|&nbsp; "
+        f"**Transactions:** `{len(clean_tx):,}`"
+    )
+
+with hdr_right:
+    full_export_csv = clv_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Export Full Intelligence (CSV)",
+        data=full_export_csv,
+        file_name=f"customer_intelligence_export_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+
+# Compute Top Global KPIs
+total_custs = len(clv_df)
+active_custs = (clv_df["P_Alive"] >= 0.50).sum()
+active_pct = (active_custs / max(total_custs, 1)) * 100
+total_historical_rev = clv_df["Monetary"].sum()
+total_pred_90d_rev = clv_df["Predicted_Spend_90d"].sum()
+avg_tenure_days = clv_df["Tenure"].mean()
+
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+with kpi1:
+    render_kpi("Total Customers", f"{total_custs:,}", "Total unique accounts", "blue")
+with kpi2:
+    render_kpi("Active Rate", f"{active_pct:.1f}%", f"{active_custs:,} with P(Alive) ≥ 50%", "green")
+with kpi3:
+    render_kpi("Realized Revenue", f"${total_historical_rev:,.0f}", "Historical lifetime spend", "blue")
+with kpi4:
+    render_kpi("90-Day Forecast", f"${total_pred_90d_rev:,.0f}", "Predicted future revenue", "green")
+with kpi5:
+    render_kpi("Avg Customer Tenure", f"{avg_tenure_days:.0f} days", "Since initial acquisition", "amber")
+
+st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------------------------------------------
+# 5 Interactive Enterprise Tabs
+# -------------------------------------------------------------------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Executive KPI & Cohort Matrix",
+    "🎯 RFM-T Rule Segmentation",
+    "🤖 Unsupervised ML Clustering",
+    "🔮 Predictive CLV & Churn Radar",
+    "💰 What-If ROI Simulator & Playbook"
+])
+
+
+# -------------------------------------------------------------------------------------------------
+# TAB 1: Executive KPI & Triangle Cohort Retention Matrix
+# -------------------------------------------------------------------------------------------------
+with tab1:
+    st.subheader("📈 Month-over-Month Acquisition Cohort Retention")
+    st.caption("Track retention decay dynamics across monthly customer acquisition cohorts over a 24-month horizon.")
+
+    try:
+        count_matrix, retention_matrix, cohort_sizes = compute_monthly_cohort_matrix(clean_tx)
+        
+        c_left, c_right = st.columns([2, 1])
+        with c_left:
+            fig_cohort = create_cohort_retention_heatmap(retention_matrix, count_matrix)
+            st.plotly_chart(fig_cohort, use_container_width=True)
+            
+        with c_right:
+            fig_curve = create_average_retention_curve(retention_matrix)
+            st.plotly_chart(fig_curve, use_container_width=True)
+            
+            # Retention Health Check
+            m1_ret = retention_matrix.mean().get(1, 0)
+            m3_ret = retention_matrix.mean().get(3, 0)
+            m6_ret = retention_matrix.mean().get(6, 0)
+            
+            st.markdown(
+                f"""
+                <div class="kpi-container" style="margin-top: 10px;">
+                    <div class="kpi-label">Retention Benchmarks</div>
+                    <div style="font-size: 0.90rem; line-height: 1.8; color: #E2E8F0;">
+                        <div>⚡ <strong>Month 1 Retention:</strong> <span class="sub-green">{m1_ret:.1f}%</span></div>
+                        <div>⚡ <strong>Month 3 Retention:</strong> <span class="sub-blue">{m3_ret:.1f}%</span></div>
+                        <div>⚡ <strong>Month 6 Retention:</strong> <span class="sub-amber">{m6_ret:.1f}%</span></div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            
+    except Exception as err:
+        st.warning(f"Unable to render cohort matrix: {err}")
+
+
+# -------------------------------------------------------------------------------------------------
+# TAB 2: RFM-T Rule Segmentation
+# -------------------------------------------------------------------------------------------------
+with tab2:
+    st.subheader("🎯 Enterprise RFM-T 7-Segment Value Hierarchy")
+    st.caption("Customer classification using Recency, Frequency, Monetary, and Tenure quintile scoring (1-5 scale).")
+
+    segment_summary = get_segment_kpi_summary(clv_df)
+
+    col_treemap, col_charts = st.columns([1, 1])
+
+    with col_treemap:
+        st.markdown("**Segment Revenue & Volume Hierarchy Treemap**")
+        fig_tree = px.treemap(
+            clv_df,
+            path=["Segment", "CustomerID"],
+            values="Monetary",
+            color="Segment",
+            color_discrete_map=SEGMENT_COLORS,
+            template="plotly_dark"
+        )
+        fig_tree.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=400)
+        st.plotly_chart(fig_tree, use_container_width=True)
+
+    with col_charts:
+        st.markdown("**Segment Share: Customer Volume vs. Revenue Contribution**")
+        fig_donut = px.pie(
+            segment_summary,
+            names="Segment",
+            values="TotalRevenue",
+            color="Segment",
+            color_discrete_map=SEGMENT_COLORS,
+            hole=0.45,
+            template="plotly_dark"
+        )
+        fig_donut.update_traces(textposition='inside', textinfo='percent+label')
+        fig_donut.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=400, showlegend=False)
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("📋 Segment Performance Benchmark Summary")
+
+    display_seg = segment_summary.rename(columns={
+        "CustomerCount": "Customers",
+        "CustomerSharePct": "Cust %",
+        "TotalRevenue": "Total Revenue ($)",
+        "RevenueSharePct": "Rev %",
+        "AvgRevenue": "Avg Spend / Cust ($)",
+        "AvgRecency": "Avg Recency (Days)",
+        "AvgFrequency": "Avg Orders",
+        "AvgTenure": "Avg Tenure (Days)",
+        "AvgAOV": "Avg AOV ($)"
+    })
+    
+    st.dataframe(
+        display_seg,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Total Revenue ($)": st.column_config.NumberColumn(format="$%,.2f"),
+            "Avg Spend / Cust ($)": st.column_config.NumberColumn(format="$%,.2f"),
+            "Avg AOV ($)": st.column_config.NumberColumn(format="$%,.2f"),
+            "Cust %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Rev %": st.column_config.NumberColumn(format="%.1f%%")
+        }
+    )
+
+
+# -------------------------------------------------------------------------------------------------
+# TAB 3: Unsupervised Machine Learning Clustering & PCA 3D
+# -------------------------------------------------------------------------------------------------
+with tab3:
+    st.subheader("🤖 Unsupervised Machine Learning (K-Means & PCA 3D)")
+    st.caption("Normalized feature space ($\log(1+x)$ + StandardScaler) with dynamic Silhouette Optimization and 3D PCA projection.")
+
+    # Evaluate k=2 to k=7
+    X_scaled, _, _ = compute_pca_3d(clv_df)
+    eval_df = evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
+    optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
+
+    c_sel, c_opt = st.columns([2, 1])
+    with c_sel:
+        selected_k = st.slider("Select Number of Clusters (k)", min_value=2, max_value=7, value=optimal_k)
+    with c_opt:
+        st.markdown(
+            f"""
+            <div class="kpi-container" style="padding: 10px 16px; margin-top: 4px;">
+                <div class="kpi-label">Algorithm Recommendation</div>
+                <div style="font-size: 1.1rem; font-weight: 700; color: #10B981;">Optimal k = {optimal_k}</div>
+                <div style="font-size: 0.75rem; color: #94A3B8;">Max Silhouette Score: {eval_df.loc[eval_df['k']==optimal_k, 'Silhouette_Score'].values[0]:.4f}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # Perform clustering
+    df_clustered, km_model, cluster_summary = perform_kmeans_clustering(clv_df, n_clusters=selected_k)
+    df_clustered, _, exp_variance = compute_pca_3d(df_clustered)
+
+    col_sil, col_elbow = st.columns([1, 1])
+    with col_sil:
+        fig_sil = px.line(
+            eval_df,
+            x="k",
+            y="Silhouette_Score",
+            markers=True,
+            title="<b>Silhouette Score Analysis (Higher is Better)</b>",
+            template="plotly_dark",
+            labels={"Silhouette_Score": "Silhouette Score", "k": "Clusters (k)"}
+        )
+        fig_sil.add_vline(x=selected_k, line_dash="dash", line_color="#38BDF8", annotation_text=f"Selected k={selected_k}")
+        fig_sil.update_layout(height=300, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_sil, use_container_width=True)
+
+    with col_elbow:
+        fig_elbow = px.line(
+            eval_df,
+            x="k",
+            y="Inertia",
+            markers=True,
+            title="<b>Elbow Method (Inertia Decay)</b>",
+            template="plotly_dark",
+            labels={"Inertia": "Within-Cluster Sum of Squares", "k": "Clusters (k)"}
+        )
+        fig_elbow.add_vline(x=selected_k, line_dash="dash", line_color="#F59E0B")
+        fig_elbow.update_layout(height=300, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_elbow, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("🌐 3D Spatial PCA Cluster Visualization")
+    st.caption(f"Principal Components Variance Explained: PC1: {exp_variance[0]}% | PC2: {exp_variance[1]}% | PC3: {exp_variance[2]}% (Total: {exp_variance[:3].sum():.1f}%)")
+
+    fig_3d_pca = px.scatter_3d(
+        df_clustered,
+        x="PCA_1",
+        y="PCA_2",
+        z="PCA_3",
+        color="ML_Cluster",
+        hover_name="CustomerID",
+        hover_data={
+            "Segment": True,
+            "Monetary": ":$,.2f",
+            "Recency": True,
+            "Frequency": True,
+            "Tenure": True,
+            "PCA_1": False,
+            "PCA_2": False,
+            "PCA_3": False
+        },
+        size="Monetary",
+        size_max=24,
+        opacity=0.85,
+        template="plotly_dark"
+    )
+    fig_3d_pca.update_layout(
+        height=580,
+        margin=dict(l=0, r=0, t=10, b=0),
+        scene=dict(
+            xaxis_title="Principal Component 1 (Volume/Spend)",
+            yaxis_title="Principal Component 2 (Tenure/Recency)",
+            zaxis_title="Principal Component 3 (AOV)"
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=0.02, xanchor="center", x=0.5)
+    )
+    st.plotly_chart(fig_3d_pca, use_container_width=True)
+
+    st.markdown("### 📊 ML Cluster Profiling Matrix")
+    st.dataframe(cluster_summary, use_container_width=True, hide_index=True)
+
+
+# -------------------------------------------------------------------------------------------------
+# TAB 4: Predictive CLV & Real-Time Churn Radar
+# -------------------------------------------------------------------------------------------------
+with tab4:
+    st.subheader("🔮 Probabilistic BTYD CLV & Real-Time Churn Radar")
+    st.caption("Continuous-time Buy-Till-You-Die (BTYD) P(Alive) estimation and 90-day forward value projection.")
+
+    # Churn Tier Summary
+    churn_counts = clv_df["Churn_Risk_Tier"].value_counts()
+    c_low = churn_counts.get("🟢 Low Churn Risk", 0)
+    c_mod = churn_counts.get("🟡 Moderate Watch", 0)
+    c_high = churn_counts.get("🔴 High Churn Risk", 0)
+
+    ct1, ct2, ct3 = st.columns(3)
+    with ct1:
+        render_kpi("Low Churn Risk", f"{c_low:,}", f"{c_low/total_custs*100:.1f}% healthy customers (P(Alive) ≥ 75%)", "green")
+    with ct2:
+        render_kpi("Moderate Watch", f"{c_mod:,}", f"{c_mod/total_custs*100:.1f}% showing decay (45% ≤ P(Alive) < 75%)", "amber")
+    with ct3:
+        render_kpi("High Churn Risk", f"{c_high:,}", f"{c_high/total_custs*100:.1f}% critical danger (P(Alive) < 45%)", "red")
+
+    st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
+
+    col_pdist, col_scatter_clv = st.columns([1, 1])
+
+    with col_pdist:
+        fig_p_alive = px.histogram(
+            clv_df,
+            x="P_Alive_Pct",
+            nbins=30,
+            color="Churn_Risk_Tier",
+            color_discrete_map={
+                "🟢 Low Churn Risk": "#10B981",
+                "🟡 Moderate Watch": "#F59E0B",
+                "🔴 High Churn Risk": "#EF4444"
+            },
+            title="<b>P(Alive) Customer Active Probability Distribution</b>",
+            template="plotly_dark",
+            labels={"P_Alive_Pct": "P(Alive) %"}
+        )
+        fig_p_alive.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_p_alive, use_container_width=True)
+
+    with col_scatter_clv:
+        fig_scatter_clv = px.scatter(
+            clv_df,
+            x="Monetary",
+            y="Predicted_Spend_90d",
+            color="Segment",
+            color_discrete_map=SEGMENT_COLORS,
+            size="P_Alive_Pct",
+            hover_name="CustomerID",
+            hover_data={
+                "P_Alive_Pct": ":.1f%",
+                "Expected_Orders_90d": True,
+                "Predictive_CLV_90d": ":$,.2f"
+            },
+            title="<b>Historical Spend vs. 90-Day Forecasted Revenue</b>",
+            template="plotly_dark",
+            labels={"Monetary": "Historical Spend ($)", "Predicted_Spend_90d": "Predicted 90-Day Spend ($)"}
+        )
+        fig_scatter_clv.update_layout(height=380, margin=dict(l=20, r=20, t=40, b=20))
+        st.plotly_chart(fig_scatter_clv, use_container_width=True)
+
+    st.markdown("---")
+
+    # Urgent Churn Watchlist Table
+    st.subheader("🚨 Urgent Churn Watchlist (High-Spend Accounts in Critical Decay)")
+    st.caption("Customers with above-median historical spend whose active probability $P(\\text{Alive}) < 45\\%$. Immediate intervention required.")
+
+    urgent_watchlist = get_urgent_churn_watchlist(clv_df, p_alive_threshold=0.45)
+
+    col_tbl, col_dl = st.columns([3, 1])
+    with col_tbl:
+        st.markdown(f"**Found {len(urgent_watchlist)} high-value at-risk accounts.**")
+    with col_dl:
+        watchlist_csv = urgent_watchlist.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Download Churn Watchlist (CSV)",
+            data=watchlist_csv,
+            file_name="urgent_churn_intervention_watchlist.csv",
+            mime="text/csv",
+            key="dl_watchlist"
+        )
+
+    watch_display = urgent_watchlist[[
+        "CustomerID", "Segment", "P_Alive_Pct", "Churn_Risk_Tier",
+        "Monetary", "Frequency", "Recency", "Tenure", "AvgOrderValue", "TopCategory"
+    ]].copy()
+
+    watch_display["Monetary"] = watch_display["Monetary"].map("${:,.2f}".format)
+    watch_display["AvgOrderValue"] = watch_display["AvgOrderValue"].map("${:,.2f}".format)
+    watch_display["P_Alive_Pct"] = watch_display["P_Alive_Pct"].map("{:.1f}%".format)
+    watch_display["Recency"] = watch_display["Recency"].map("{} days".format)
+
+    st.dataframe(watch_display, hide_index=True, use_container_width=True)
+
+
+# -------------------------------------------------------------------------------------------------
+# TAB 5: What-If Marketing ROI Simulator & Action Playbooks
+# -------------------------------------------------------------------------------------------------
+with tab5:
+    st.subheader("💰 'What-If' Marketing Campaign ROI & Action Playbook Simulator")
+    st.caption("Simulate expected revenue, incremental margin, net ROI, and payback period across targeted segments.")
+
+    all_segs = list(SEGMENT_PLAYBOOKS.keys())
+
+    col_inputs, col_sim_results = st.columns([1, 1])
+
+    with col_inputs:
+        st.markdown("### 🎛️ Campaign Configuration")
+        target_segment = st.selectbox("1. Target Customer Segment", all_segs, index=3)  # Default: At-Risk VIPs
+        
+        seg_cust_df = clv_df[clv_df["Segment"] == target_segment]
+        max_reach = len(seg_cust_df)
+        
+        target_audience_pct = st.slider("2. Segment Penetration Reach (%)", min_value=10, max_value=100, value=80, step=5)
+        audience_size = int(max_reach * (target_audience_pct / 100.0))
+        
+        campaign_budget = st.number_input("3. Total Campaign Budget ($)", min_value=500, max_value=50000, value=3500, step=500)
+        expected_conv_rate = st.slider("4. Expected Campaign Conversion Rate (%)", min_value=1.0, max_value=30.0, value=8.5, step=0.5)
+        gross_margin_pct = st.slider("5. Product Gross Margin (%)", min_value=15, max_value=85, value=40, step=5)
+
+    # Calculate Simulation Financials
+    avg_segment_aov = seg_cust_df["AvgOrderValue"].mean() if len(seg_cust_df) > 0 else 150.0
+    projected_conversions = audience_size * (expected_conv_rate / 100.0)
+    projected_gross_revenue = projected_conversions * avg_segment_aov
+    projected_gross_profit = projected_gross_revenue * (gross_margin_pct / 100.0)
+    net_incremental_profit = projected_gross_profit - campaign_budget
+    campaign_roi_pct = (net_incremental_profit / max(campaign_budget, 1)) * 100.0
+    cost_per_acquisition = campaign_budget / max(projected_conversions, 1)
+
+    with col_sim_results:
+        st.markdown("### 📊 Projected Financial ROI")
+        
+        roi_color = "sub-green" if net_incremental_profit > 0 else "sub-red"
+        st.markdown(
+            f"""
+            <div class="sim-card">
+                <div style="font-size: 0.85rem; color: #94A3B8; text-transform: uppercase;">Campaign Performance Estimate</div>
+                <div style="font-size: 2.2rem; font-weight: 800; color: #F8FAFC; margin-top: 4px;">
+                    ${projected_gross_revenue:,.2f}
+                </div>
+                <div style="font-size: 0.95rem; margin-top: 6px;" class="{roi_color}">
+                    <strong>Net Incremental Profit:</strong> ${net_incremental_profit:,.2f} ({campaign_roi_pct:+.1f}% Net ROI)
+                </div>
+                <hr style="border-color: rgba(255,255,255,0.15); margin: 14px 0;" />
+                <div style="font-size: 0.90rem; line-height: 1.8; color: #E2E8F0;">
+                    <div>👥 <strong>Targeted Audience:</strong> {audience_size:,} of {max_reach:,} customers</div>
+                    <div>🎯 <strong>Projected Orders:</strong> {projected_conversions:.1f} orders</div>
+                    <div>💵 <strong>Estimated Segment AOV:</strong> ${avg_segment_aov:,.2f}</div>
+                    <div>💳 <strong>Cost Per Converted Order:</strong> ${cost_per_acquisition:,.2f}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # Segment Playbook & Actionable Campaign
+    st.subheader(f"🚀 Targeted Action Playbook: {SEGMENT_ICONS[target_segment]} {target_segment}")
+    playbook = SEGMENT_PLAYBOOKS[target_segment]
+
+    st.markdown(
+        f"""
+        <div class="playbook-box" style="border-left: 6px solid {playbook['color']};">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin: 0; color: {playbook['color']};">{playbook['icon']} {playbook['title']}</h3>
+                <span class="badge" style="background: {playbook['color']}22; color: {playbook['color']}; border: 1px solid {playbook['color']};">
+                    {playbook['badge']}
+                </span>
+            </div>
+            <p style="font-size: 1.0rem; color: #E2E8F0; margin-top: 8px;">{playbook['profile']}</p>
+            <div style="background: rgba(255,255,255,0.04); border-radius: 8px; padding: 10px 16px; margin-top: 8px;">
+                <strong style="color: #38BDF8;">🎯 Strategic Objective:</strong> {playbook['objective']}
+            </div>
+            <div style="margin-top: 10px;">
+                <strong>📡 Best Channels:</strong> <span class="badge" style="background:#334155; color:#F8FAFC;">{playbook['best_channel']}</span> &nbsp;
+                <strong>🎁 Recommended Promo:</strong> <span class="badge" style="background:#334155; color:#F8FAFC;">{playbook['promo_type']}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    c_acts, c_email = st.columns([1, 1])
+
+    with c_acts:
+        st.markdown("#### 📋 Recommended Playbook Action Items")
+        for act in playbook["actions"]:
+            st.markdown(f"- ⚡ **{act}**")
+
+        st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+        # Segment download button
+        target_export_csv = seg_cust_df.head(audience_size).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"📥 Export Targeted Audience List ({audience_size} Customers CSV)",
+            data=target_export_csv,
+            file_name=f"campaign_target_{target_segment.lower().replace(' ', '_')}.csv",
+            mime="text/csv",
+            key="dl_target_campaign"
+        )
+
+    with c_email:
+        st.markdown("#### ✉️ Campaign Copy Blueprint")
+        camp = playbook["campaign_template"]
+        st.markdown(
+            f"""
+            <div style="background: rgba(30, 41, 59, 0.7); border: 1px dashed rgba(148, 163, 184, 0.3); border-radius: 12px; padding: 16px;">
+                <div style="font-size: 0.85rem; color: #94A3B8; margin-bottom: 4px;">
+                    <strong>Subject:</strong> {camp['subject']}
+                </div>
+                <div style="font-size: 0.95rem; font-weight: 700; color: #38BDF8; margin-bottom: 8px;">
+                    {camp['headline']}
+                </div>
+                <div style="font-size: 0.92rem; color: #F8FAFC; line-height: 1.6; white-space: pre-wrap;">
+{camp['body']}
+                </div>
+                <div style="margin-top: 12px;">
+                    <span style="background: #3B82F6; color: white; padding: 6px 14px; border-radius: 6px; font-size: 0.85rem; font-weight: 600;">
+                        🔘 {camp['cta']}
+                    </span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
