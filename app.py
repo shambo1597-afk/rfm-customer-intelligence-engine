@@ -170,8 +170,20 @@ def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
     )
 
 
+def detect_default_column(columns: list[str], keywords: list[str], fallback_idx: int = 0) -> int:
+    """
+    Finds the index of the first column whose normalized name matches any of the keywords.
+    """
+    for i, col in enumerate(columns):
+        clean = col.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+        for kw in keywords:
+            if kw in clean:
+                return i
+    return min(fallback_idx, max(0, len(columns) - 1)) if columns else 0
+
+
 # -------------------------------------------------------------------------------------------------
-# Sidebar: File Upload, Snapshot Date & Analysis Settings
+# Sidebar: File Upload, Snapshot Date, Column Mapping & Analysis Settings
 # -------------------------------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("## 🎯 Intelligence Hub")
@@ -206,19 +218,79 @@ with st.sidebar:
     if df_raw.empty:
         st.stop()
 
+    raw_columns = list(df_raw.columns)
+
+    # ---------------------------------------------------------------------------------------------
+    # Dynamic Column Mapping Dropdowns
+    # ---------------------------------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("🧩 Column Mapping")
+    
+    cust_default_idx = detect_default_column(raw_columns, ["customerid", "customer", "customerno", "clientid", "userid", "user", "client", "id"], 0)
+    date_default_idx = detect_default_column(raw_columns, ["purchasedate", "invoicedate", "orderdate", "date", "timestamp", "time", "datetime"], min(1, len(raw_columns)-1))
+    spend_default_idx = detect_default_column(raw_columns, ["totalspend", "total", "spend", "amount", "sales", "revenue", "price", "unitprice"], min(2, len(raw_columns)-1))
+
+    with st.expander("⚙️ Map Dataset Columns", expanded=True):
+        st.caption("Select the columns matching each required engine field:")
+        col_cust = st.selectbox(
+            "Customer ID Column *",
+            options=raw_columns,
+            index=cust_default_idx,
+            help="Unique customer identifier (e.g. CustomerID, User ID, Client ID)."
+        )
+        col_date = st.selectbox(
+            "Transaction Date Column *",
+            options=raw_columns,
+            index=date_default_idx,
+            help="Transaction timestamp or date (e.g. PurchaseDate, OrderDate, InvoiceDate)."
+        )
+        col_spend = st.selectbox(
+            "Total Spend / Amount Column *",
+            options=raw_columns,
+            index=spend_default_idx,
+            help="Monetary transaction value or total sales (e.g. TotalSpend, Amount, Sales)."
+        )
+
+        optional_options = ["(Auto-Detect / None)"] + raw_columns
+
+        inv_default = detect_default_column(raw_columns, ["invoiceno", "invoice", "orderno", "orderid", "transactionid"], -1)
+        inv_idx = (inv_default + 1) if inv_default >= 0 else 0
+        col_invoice = st.selectbox(
+            "Invoice / Order ID (Optional)",
+            options=optional_options,
+            index=inv_idx,
+            help="Order or invoice number for frequency deduplication."
+        )
+
+        cat_default = detect_default_column(raw_columns, ["productcategory", "category", "itemcategory", "dept", "product"], -1)
+        cat_idx = (cat_default + 1) if cat_default >= 0 else 0
+        col_cat = st.selectbox(
+            "Product / Category (Optional)",
+            options=optional_options,
+            index=cat_idx,
+            help="Product category or item description for category affinity."
+        )
+
+    # Build active custom column mapping dictionary
+    column_mapping = {
+        "CustomerID": col_cust,
+        "PurchaseDate": col_date,
+        "TotalSpend": col_spend
+    }
+    if col_invoice != "(Auto-Detect / None)":
+        column_mapping["InvoiceNo"] = col_invoice
+    if col_cat != "(Auto-Detect / None)":
+        column_mapping["ProductCategory"] = col_cat
+
     st.markdown("---")
     st.subheader("⚙️ Reference Timeline")
 
-    # Detect max transaction date for snapshot reference
-    df_temp = df_raw.copy()
-    for col in df_temp.columns:
-        if "date" in col.lower() or "time" in col.lower():
-            df_temp[col] = pd.to_datetime(df_temp[col], errors="coerce")
-            max_dt = df_temp[col].max()
-            if pd.notnull(max_dt):
-                default_snapshot = (max_dt + timedelta(days=1)).date()
-                break
-    else:
+    # Detect max transaction date from the mapped date column
+    try:
+        parsed_dates = pd.to_datetime(df_raw[col_date], errors="coerce")
+        max_dt = parsed_dates.max()
+        default_snapshot = (max_dt + timedelta(days=1)).date() if pd.notnull(max_dt) else datetime.now().date()
+    except Exception:
         default_snapshot = datetime.now().date()
 
     use_custom_date = st.checkbox("Custom Snapshot Date", value=False)
@@ -235,7 +307,7 @@ with st.sidebar:
 # Core Processing Pipeline (RFM-T, CLV, ML, Cohorts)
 # -------------------------------------------------------------------------------------------------
 try:
-    clean_tx, rfmt_df = process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date)
+    clean_tx, rfmt_df = process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
     clv_df = estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
     rfmt_ml, pca_model, exp_var = compute_pca_3d(clv_df)
 except Exception as e:

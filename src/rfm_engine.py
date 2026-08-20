@@ -189,12 +189,27 @@ SEGMENT_PLAYBOOKS = {
 }
 
 
-def standardize_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> pd.DataFrame:
     """
     Standardizes transaction columns from various e-commerce schemas.
+    Accepts optional custom_mapping dict (e.g. {'CustomerID': 'client_id', 'PurchaseDate': 'tx_date', 'TotalSpend': 'amount'})
     """
+    df_clean = df.copy()
+
+    # Apply explicit user-defined custom mappings first
+    if custom_mapping:
+        rename_dict = {}
+        for std_col, src_col in custom_mapping.items():
+            if src_col and src_col in df_clean.columns:
+                rename_dict[src_col] = std_col
+        if rename_dict:
+            df_clean = df_clean.rename(columns=rename_dict)
+
+    # Standard auto-detection for any unmapped standard columns
     col_mapping = {}
-    for col in df.columns:
+    for col in df_clean.columns:
+        if col in ["InvoiceNo", "CustomerID", "PurchaseDate", "ProductCategory", "Product", "Quantity", "UnitPrice", "TotalSpend"]:
+            continue
         clean = col.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
         if clean in ["invoiceno", "invoice", "invoicenumber", "orderno", "orderid", "transactionid"]:
             col_mapping[col] = "InvoiceNo"
@@ -213,7 +228,7 @@ def standardize_transactions(df: pd.DataFrame) -> pd.DataFrame:
         elif clean in ["totalspend", "total", "spend", "amount", "sales", "revenue"]:
             col_mapping[col] = "TotalSpend"
 
-    df_clean = df.rename(columns=col_mapping).copy()
+    df_clean = df_clean.rename(columns=col_mapping).copy()
 
     # Verify essential columns
     for req in ["CustomerID", "PurchaseDate"]:
@@ -381,12 +396,12 @@ def assign_7_segment_taxonomy(row: pd.Series) -> str:
     return "Hibernating"
 
 
-def process_rfmt_pipeline(df: pd.DataFrame, snapshot_date=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+def process_rfmt_pipeline(df: pd.DataFrame, snapshot_date=None, custom_mapping: dict = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Full RFM-T processing pipeline:
     Returns (cleaned_transactions_df, rfmt_customer_df)
     """
-    clean_tx = standardize_transactions(df)
+    clean_tx = standardize_transactions(df, custom_mapping=custom_mapping)
     rfmt = compute_rfmt(clean_tx, snapshot_date=snapshot_date)
     rfmt_scored = calculate_rfmt_scores(rfmt)
     rfmt_scored["Segment"] = rfmt_scored.apply(assign_7_segment_taxonomy, axis=1)
