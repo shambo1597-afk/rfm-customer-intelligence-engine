@@ -144,6 +144,9 @@ ENTERPRISE_CSS = """
 st.markdown(ENTERPRISE_CSS, unsafe_allow_html=True)
 
 
+# -------------------------------------------------------------------------------------------------
+# Streamlit High-Performance Caching Layer
+# -------------------------------------------------------------------------------------------------
 @st.cache_data
 def load_default_transactions(dataset_key: str = "enterprise"):
     if dataset_key == "uci" and os.path.exists("data/real_online_retail.csv"):
@@ -156,6 +159,36 @@ def load_default_transactions(dataset_key: str = "enterprise"):
                 pass
     st.error("Default transaction dataset not found. Please upload a CSV.")
     return pd.DataFrame()
+
+
+@st.cache_data(show_spinner="Computing RFM-T & Scoring Segments...")
+def cached_process_rfmt_pipeline(df: pd.DataFrame, snapshot_date=None, custom_mapping: dict = None):
+    return process_rfmt_pipeline(df, snapshot_date=snapshot_date, custom_mapping=custom_mapping)
+
+
+@st.cache_data(show_spinner="Estimating BTYD P(Alive) & Predictive CLV...")
+def cached_estimate_btyd_clv(rfmt_df: pd.DataFrame, prediction_horizon_days: int = 90, gross_margin: float = 0.35):
+    return estimate_btyd_clv(rfmt_df, prediction_horizon_days=prediction_horizon_days, gross_margin=gross_margin)
+
+
+@st.cache_data(show_spinner="Computing PCA 3D Projections...")
+def cached_compute_pca_3d(clv_df: pd.DataFrame):
+    return compute_pca_3d(clv_df)
+
+
+@st.cache_data(show_spinner="Evaluating Optimal Clusters...")
+def cached_evaluate_kmeans_candidates(X_values: np.ndarray, min_k: int = 2, max_k: int = 7):
+    return evaluate_kmeans_candidates(X_values, min_k=min_k, max_k=max_k)
+
+
+@st.cache_data(show_spinner="Clustering Customer Profiles...")
+def cached_perform_kmeans_clustering(clv_df: pd.DataFrame, n_clusters: int = 4):
+    return perform_kmeans_clustering(clv_df, n_clusters=n_clusters)
+
+
+@st.cache_data(show_spinner="Building Monthly Cohort Retention Matrix...")
+def cached_compute_monthly_cohort_matrix(clean_tx: pd.DataFrame):
+    return compute_monthly_cohort_matrix(clean_tx)
 
 
 def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
@@ -342,9 +375,9 @@ with st.sidebar:
 # Core Processing Pipeline (RFM-T, CLV, ML, Cohorts)
 # -------------------------------------------------------------------------------------------------
 try:
-    clean_tx, rfmt_df = process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
-    clv_df = estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
-    rfmt_ml, pca_model, exp_var = compute_pca_3d(clv_df)
+    clean_tx, rfmt_df = cached_process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
+    clv_df = cached_estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
+    rfmt_ml, pca_model, exp_var = cached_compute_pca_3d(clv_df)
 except Exception as e:
     st.error(f"Error processing transaction dataset: {e}")
     st.stop()
@@ -419,7 +452,7 @@ with tab1:
     st.caption("Track retention decay dynamics across monthly customer acquisition cohorts over a 24-month horizon.")
 
     try:
-        count_matrix, retention_matrix, cohort_sizes = compute_monthly_cohort_matrix(clean_tx)
+        count_matrix, retention_matrix, cohort_sizes = cached_compute_monthly_cohort_matrix(clean_tx)
         
         c_left, c_right = st.columns([2, 1])
         with c_left:
@@ -529,8 +562,8 @@ with tab3:
     st.caption("Normalized feature space ($\log(1+x)$ + StandardScaler) with dynamic Silhouette Optimization and 3D PCA projection.")
 
     # Evaluate k=2 to k=7
-    X_scaled, _, _ = compute_pca_3d(clv_df)
-    eval_df = evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
+    X_scaled, _, _ = cached_compute_pca_3d(clv_df)
+    eval_df = cached_evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
     optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
 
     c_sel, c_opt = st.columns([2, 1])
@@ -549,8 +582,8 @@ with tab3:
         )
 
     # Perform clustering
-    df_clustered, km_model, cluster_summary = perform_kmeans_clustering(clv_df, n_clusters=selected_k)
-    df_clustered, _, exp_variance = compute_pca_3d(df_clustered)
+    df_clustered, km_model, cluster_summary = cached_perform_kmeans_clustering(clv_df, n_clusters=selected_k)
+    df_clustered, _, exp_variance = cached_compute_pca_3d(df_clustered)
 
     col_sil, col_elbow = st.columns([1, 1])
     with col_sil:

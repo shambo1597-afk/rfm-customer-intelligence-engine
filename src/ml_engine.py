@@ -35,16 +35,21 @@ def preprocess_rfmt_features(rfmt_df: pd.DataFrame) -> tuple[np.ndarray, Standar
 def evaluate_kmeans_candidates(X_scaled: np.ndarray, min_k: int = 2, max_k: int = 7, random_state: int = 42) -> pd.DataFrame:
     """
     Evaluates K-Means clustering across a range of k values, computing Inertia (Elbow)
-    and Silhouette Scores.
+    and Silhouette Scores with sub-sampling to prevent CPU freezing on large datasets.
     """
     eval_records = []
+    n_samples = len(X_scaled)
+    samp_size = min(1000, n_samples) if n_samples > 1000 else None
     
     for k in range(min_k, max_k + 1):
         km = KMeans(n_clusters=k, init="k-means++", n_init=10, random_state=random_state)
         cluster_labels = km.fit_predict(X_scaled)
         
         inertia = km.inertia_
-        sil_score = silhouette_score(X_scaled, cluster_labels)
+        if samp_size is not None:
+            sil_score = silhouette_score(X_scaled, cluster_labels, sample_size=samp_size, random_state=random_state)
+        else:
+            sil_score = silhouette_score(X_scaled, cluster_labels)
         
         eval_records.append({
             "k": k,
