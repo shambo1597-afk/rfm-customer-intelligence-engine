@@ -196,45 +196,42 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
     """
     df_clean = df.copy()
 
-    # Apply explicit user-defined custom mappings first
+    # 1. Robust 1D Series Extraction via custom_mapping and .squeeze()
     if custom_mapping:
-        rename_dict = {}
-        for std_col, src_col in custom_mapping.items():
-            if src_col and src_col in df_clean.columns:
-                rename_dict[src_col] = std_col
-        if rename_dict:
-            df_clean = df_clean.rename(columns=rename_dict)
+        cust_col = custom_mapping.get("CustomerID")
+        date_col = custom_mapping.get("PurchaseDate")
+        spend_col = custom_mapping.get("TotalSpend")
+        invoice_col = custom_mapping.get("InvoiceNo")
+        cat_col = custom_mapping.get("ProductCategory")
 
-    # Standard auto-detection for any unmapped standard columns
-    col_mapping = {}
+        if cust_col and cust_col in df_clean.columns:
+            df_clean["CustomerID"] = df_clean[cust_col].squeeze().astype(str)
+        if date_col and date_col in df_clean.columns:
+            df_clean["PurchaseDate"] = pd.to_datetime(df_clean[date_col].squeeze(), errors="coerce")
+        if spend_col and spend_col in df_clean.columns:
+            df_clean["TotalSpend"] = pd.to_numeric(df_clean[spend_col].squeeze(), errors="coerce")
+        if invoice_col and invoice_col in df_clean.columns:
+            df_clean["InvoiceNo"] = df_clean[invoice_col].squeeze().astype(str)
+        if cat_col and cat_col in df_clean.columns:
+            df_clean["ProductCategory"] = df_clean[cat_col].squeeze().astype(str)
+
+    # Auto-detection for standard columns if not yet set
     for col in df_clean.columns:
-        if col in ["InvoiceNo", "CustomerID", "PurchaseDate", "ProductCategory", "Product", "Quantity", "UnitPrice", "TotalSpend"]:
-            continue
         clean = col.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
-        if clean in ["invoiceno", "invoice", "invoicenumber", "orderno", "orderid", "transactionid"]:
-            col_mapping[col] = "InvoiceNo"
-        elif clean in ["customerid", "customer", "customerno", "clientid", "userid"]:
-            col_mapping[col] = "CustomerID"
-        elif clean in ["purchasedate", "date", "invoicedate", "orderdate", "timestamp", "datetime"]:
-            col_mapping[col] = "PurchaseDate"
-        elif clean in ["productcategory", "category", "itemcategory", "dept"]:
-            col_mapping[col] = "ProductCategory"
-        elif clean in ["product", "productname", "item", "description", "sku"]:
-            col_mapping[col] = "Product"
-        elif clean in ["quantity", "qty", "count"]:
-            col_mapping[col] = "Quantity"
-        elif clean in ["unitprice", "price", "itemprice", "rate"]:
-            col_mapping[col] = "UnitPrice"
-        elif clean in ["totalspend", "total", "spend", "amount", "sales", "revenue"]:
-            col_mapping[col] = "TotalSpend"
+        if "CustomerID" not in df_clean.columns and clean in ["customerid", "customer", "customerno", "clientid", "userid"]:
+            df_clean["CustomerID"] = df_clean[col].squeeze().astype(str)
+        elif "PurchaseDate" not in df_clean.columns and clean in ["purchasedate", "date", "invoicedate", "orderdate", "timestamp", "datetime"]:
+            df_clean["PurchaseDate"] = pd.to_datetime(df_clean[col].squeeze(), errors="coerce")
+        elif "TotalSpend" not in df_clean.columns and clean in ["totalspend", "total", "spend", "amount", "sales", "revenue"]:
+            df_clean["TotalSpend"] = pd.to_numeric(df_clean[col].squeeze(), errors="coerce")
+        elif "InvoiceNo" not in df_clean.columns and clean in ["invoiceno", "invoice", "invoicenumber", "orderno", "orderid", "transactionid"]:
+            df_clean["InvoiceNo"] = df_clean[col].squeeze().astype(str)
+        elif "ProductCategory" not in df_clean.columns and clean in ["productcategory", "category", "itemcategory", "dept"]:
+            df_clean["ProductCategory"] = df_clean[col].squeeze().astype(str)
+        elif "Product" not in df_clean.columns and clean in ["product", "productname", "item", "description", "sku"]:
+            df_clean["Product"] = df_clean[col].squeeze().astype(str)
 
-    df_clean = df_clean.rename(columns=col_mapping).copy()
-
-    # Verify essential columns
-    for req in ["CustomerID", "PurchaseDate"]:
-        if req not in df_clean.columns:
-            raise ValueError(f"Required column '{req}' is missing from dataset.")
-
+    # Defaults for optional metadata fields
     if "InvoiceNo" not in df_clean.columns:
         df_clean["InvoiceNo"] = [f"INV-{i+1:06d}" for i in range(len(df_clean))]
     if "ProductCategory" not in df_clean.columns:
@@ -244,26 +241,27 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
     if "Quantity" not in df_clean.columns:
         df_clean["Quantity"] = 1
     else:
-        df_clean["Quantity"] = pd.to_numeric(df_clean["Quantity"], errors="coerce").fillna(1)
+        df_clean["Quantity"] = pd.to_numeric(df_clean["Quantity"].squeeze(), errors="coerce").fillna(1)
 
     if "UnitPrice" not in df_clean.columns:
         if "TotalSpend" in df_clean.columns:
-            df_clean["UnitPrice"] = pd.to_numeric(df_clean["TotalSpend"], errors="coerce").fillna(0.0) / df_clean["Quantity"].replace(0, 1)
+            df_clean["UnitPrice"] = pd.to_numeric(df_clean["TotalSpend"].squeeze(), errors="coerce").fillna(0.0) / df_clean["Quantity"].replace(0, 1)
         else:
             df_clean["UnitPrice"] = 25.0
     else:
-        df_clean["UnitPrice"] = pd.to_numeric(df_clean["UnitPrice"], errors="coerce").fillna(0.0)
+        df_clean["UnitPrice"] = pd.to_numeric(df_clean["UnitPrice"].squeeze(), errors="coerce").fillna(0.0)
 
     if "TotalSpend" not in df_clean.columns:
         df_clean["TotalSpend"] = round(df_clean["Quantity"] * df_clean["UnitPrice"], 2)
-    else:
-        df_clean["TotalSpend"] = pd.to_numeric(df_clean["TotalSpend"], errors="coerce").fillna(
-            round(df_clean["Quantity"] * df_clean["UnitPrice"], 2)
-        )
 
-    df_clean["PurchaseDate"] = pd.to_datetime(df_clean["PurchaseDate"], errors="coerce")
-    df_clean = df_clean.dropna(subset=["CustomerID", "PurchaseDate"]).copy()
-    df_clean["CustomerID"] = df_clean["CustomerID"].astype(str)
+    # Convert core fields with safe 1D series extraction
+    df_clean["PurchaseDate"] = pd.to_datetime(df_clean["PurchaseDate"].squeeze(), errors="coerce")
+    df_clean["TotalSpend"] = pd.to_numeric(df_clean["TotalSpend"].squeeze(), errors="coerce")
+    df_clean["CustomerID"] = df_clean["CustomerID"].squeeze().astype(str)
+
+    # 2. Clean NaNs: Drop any rows where CustomerID, PurchaseDate, or TotalSpend became NaN after conversion
+    df_clean = df_clean.dropna(subset=["CustomerID", "PurchaseDate", "TotalSpend"]).copy()
+    df_clean = df_clean[df_clean["TotalSpend"] > 0].copy()
 
     return df_clean
 

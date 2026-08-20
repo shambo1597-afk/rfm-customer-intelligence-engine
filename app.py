@@ -174,14 +174,27 @@ def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
 
 def detect_default_column(columns: list[str], keywords: list[str], fallback_idx: int = 0) -> int:
     """
-    Finds the index of the first column whose normalized name matches any of the keywords.
+    Finds the index of the best matching column for a list of priority keywords.
+    First checks exact matches across keywords in priority order,
+    then checks substring matches across keywords in priority order.
     """
-    for i, col in enumerate(columns):
-        clean = col.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
-        for kw in keywords:
-            if kw in clean:
+    if not columns:
+        return 0
+    cleaned_cols = [col.strip().lower().replace(" ", "").replace("_", "").replace("-", "") for col in columns]
+
+    # Priority 1: Exact matches in priority order of keywords
+    for kw in keywords:
+        for i, c in enumerate(cleaned_cols):
+            if c == kw:
                 return i
-    return min(fallback_idx, max(0, len(columns) - 1)) if columns else 0
+
+    # Priority 2: Substring matches in priority order of keywords
+    for kw in keywords:
+        for i, c in enumerate(cleaned_cols):
+            if kw in c:
+                return i
+
+    return min(fallback_idx, max(0, len(columns) - 1))
 
 
 # -------------------------------------------------------------------------------------------------
@@ -309,7 +322,7 @@ with st.sidebar:
 
     # Detect max transaction date from the mapped date column
     try:
-        parsed_dates = pd.to_datetime(df_raw[col_date], errors="coerce")
+        parsed_dates = pd.to_datetime(df_raw[col_date].squeeze(), errors="coerce")
         max_dt = parsed_dates.max()
         default_snapshot = (max_dt + timedelta(days=1)).date() if pd.notnull(max_dt) else datetime.now().date()
     except Exception:
