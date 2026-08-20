@@ -149,8 +149,10 @@ st.markdown(ENTERPRISE_CSS, unsafe_allow_html=True)
 # -------------------------------------------------------------------------------------------------
 @st.cache_data
 def load_default_transactions(dataset_key: str = "enterprise"):
-    if dataset_key == "uci" and os.path.exists("data/real_online_retail.csv"):
-        return pd.read_csv("data/real_online_retail.csv")
+    if dataset_key == "uci":
+        for uci_path in ["data/real_online_retail.csv.gz", "data/real_online_retail.csv"]:
+            if os.path.exists(uci_path):
+                return pd.read_csv(uci_path)
     for path in ["data/ecommerce_transactions.csv", "sample_transactions.csv"]:
         if os.path.exists(path):
             try:
