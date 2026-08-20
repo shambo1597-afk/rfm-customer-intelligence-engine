@@ -145,7 +145,9 @@ st.markdown(ENTERPRISE_CSS, unsafe_allow_html=True)
 
 
 @st.cache_data
-def load_default_transactions():
+def load_default_transactions(dataset_key: str = "enterprise"):
+    if dataset_key == "uci" and os.path.exists("data/real_online_retail.csv"):
+        return pd.read_csv("data/real_online_retail.csv")
     for path in ["data/ecommerce_transactions.csv", "sample_transactions.csv"]:
         if os.path.exists(path):
             try:
@@ -192,28 +194,48 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📁 Data Source")
     
-    uploaded_file = st.file_uploader(
-        "Upload Transactions (CSV / XLSX)",
-        type=["csv", "xlsx", "xls"],
-        help="Upload transactional records with CustomerID, PurchaseDate, and Spend/Product details."
+    dataset_source_mode = st.radio(
+        "Select Data Mode",
+        options=["Preloaded Datasets", "Upload Custom File"],
+        horizontal=True
     )
 
-    if uploaded_file is not None:
-        try:
-            if uploaded_file.name.endswith(".csv"):
-                df_raw = pd.read_csv(uploaded_file)
-            else:
-                df_raw = pd.read_excel(uploaded_file)
-            data_source_label = uploaded_file.name
-            st.success(f"Loaded `{uploaded_file.name}` ({len(df_raw):,} records)")
-        except Exception as e:
-            st.error(f"Error loading file: {e}. Falling back to default data.")
-            df_raw = load_default_transactions()
-            data_source_label = "ecommerce_transactions.csv (Fallback)"
+    if dataset_source_mode == "Upload Custom File":
+        uploaded_file = st.file_uploader(
+            "Upload Transactions (CSV / XLSX)",
+            type=["csv", "xlsx", "xls"],
+            help="Upload transactional records with CustomerID, PurchaseDate, and Spend/Product details."
+        )
+        if uploaded_file is not None:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    df_raw = pd.read_csv(uploaded_file)
+                else:
+                    df_raw = pd.read_excel(uploaded_file)
+                data_source_label = uploaded_file.name
+                st.success(f"Loaded `{uploaded_file.name}` ({len(df_raw):,} records)")
+            except Exception as e:
+                st.error(f"Error loading file: {e}. Falling back to default data.")
+                df_raw = load_default_transactions("enterprise")
+                data_source_label = "ecommerce_transactions.csv (Fallback)"
+        else:
+            df_raw = load_default_transactions("enterprise")
+            data_source_label = "data/ecommerce_transactions.csv"
+            st.info("Upload your custom CSV or XLSX file above.")
     else:
-        df_raw = load_default_transactions()
-        data_source_label = "data/ecommerce_transactions.csv"
-        st.info("Using enterprise dataset (`450 Customers / 24 Months`)")
+        dataset_options = {
+            "Enterprise Synthetic (450 Custs / 24 Months)": ("enterprise", "data/ecommerce_transactions.csv"),
+            "Authentic UCI Online Retail (4,338 Custs / 397K Tx)": ("uci", "data/real_online_retail.csv")
+        }
+        selected_dataset_label = st.selectbox(
+            "Choose Preloaded Dataset",
+            options=list(dataset_options.keys()),
+            index=0
+        )
+        ds_key, ds_path = dataset_options[selected_dataset_label]
+        df_raw = load_default_transactions(ds_key)
+        data_source_label = ds_path
+        st.info(f"Using `{selected_dataset_label}`")
 
     if df_raw.empty:
         st.stop()
