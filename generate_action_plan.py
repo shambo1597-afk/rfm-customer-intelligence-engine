@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 
 from src.rfm_engine import process_rfmt_pipeline, SEGMENT_PLAYBOOKS, get_segment_kpi_summary
-from src.ml_engine import evaluate_kmeans_candidates, perform_kmeans_clustering, compute_pca_3d
+from src.ml_engine import preprocess_rfmt_features, evaluate_kmeans_candidates, perform_kmeans_clustering, compute_pca_3d
 from src.clv_engine import estimate_btyd_clv, get_urgent_churn_watchlist, get_top_future_growth_targets
 from src.cohort_engine import compute_monthly_cohort_matrix
 
@@ -49,8 +49,11 @@ def main():
 
     # 4. Unsupervised ML K-Means & PCA 3D
     print("[*] Step 4: Optimizing K-Means Clustering & Computing 3D PCA Projections...")
-    X_scaled, _, _ = compute_pca_3d(clv_df)
-    eval_df = evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
+    # Evaluate candidate k values on the same log1p + StandardScaler feature space used by
+    # the final K-Means fit (perform_kmeans_clustering), so the recommended k is consistent
+    # with the model actually fit below (PCA is computed separately, purely for 3D display).
+    X_scaled, _, _ = preprocess_rfmt_features(clv_df)
+    eval_df = evaluate_kmeans_candidates(X_scaled, min_k=2, max_k=7)
     optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
     print(f"    -> Optimal K evaluated by Silhouette Max: k = {optimal_k} (Silhouette = {eval_df.loc[eval_df['k']==optimal_k, 'Silhouette_Score'].values[0]:.4f})")
 
