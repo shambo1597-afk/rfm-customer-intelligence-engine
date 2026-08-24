@@ -15,11 +15,14 @@ import streamlit as st
 from src.rfm_engine import (
     process_rfmt_pipeline,
     get_segment_kpi_summary,
+    ensure_series,
+    RFMPipelineError,
     SEGMENT_COLORS,
     SEGMENT_ICONS,
     SEGMENT_PLAYBOOKS
 )
 from src.ml_engine import (
+    preprocess_rfmt_features,
     evaluate_kmeans_candidates,
     perform_kmeans_clustering,
     compute_pca_3d
@@ -228,6 +231,11 @@ def cached_compute_pca_3d(clv_df: pd.DataFrame):
     return compute_pca_3d(clv_df)
 
 
+@st.cache_data(show_spinner="Normalizing RFM-T Feature Space...")
+def cached_preprocess_rfmt_features(clv_df: pd.DataFrame):
+    return preprocess_rfmt_features(clv_df)
+
+
 @st.cache_data(show_spinner="Evaluating Optimal Clusters...")
 def cached_evaluate_kmeans_candidates(X_values: np.ndarray, min_k: int = 2, max_k: int = 7):
     return evaluate_kmeans_candidates(X_values, min_k=min_k, max_k=max_k)
@@ -407,7 +415,7 @@ with st.sidebar:
 
     # Detect max transaction date from the mapped date column
     try:
-        parsed_dates = pd.to_datetime(df_raw[col_date].squeeze(), errors="coerce")
+        parsed_dates = pd.to_datetime(ensure_series(df_raw[col_date]), errors="coerce")
         max_dt = parsed_dates.max()
         default_snapshot = (max_dt + timedelta(days=1)).date() if pd.notnull(max_dt) else datetime.now().date()
     except Exception:
@@ -431,6 +439,9 @@ with st.spinner(f"⚡ Processing '{data_source_label}' & calculating RFM-T Custo
         clean_tx, rfmt_df = cached_process_rfmt_pipeline(df_raw, snapshot_date=snapshot_date, custom_mapping=column_mapping)
         clv_df = cached_estimate_btyd_clv(rfmt_df, prediction_horizon_days=90, gross_margin=0.35)
         rfmt_ml, pca_model, exp_var = cached_compute_pca_3d(clv_df)
+    except RFMPipelineError as e:
+        st.error(f"⚠️ Could not process this dataset: {e}")
+        st.stop()
     except Exception as e:
         st.error(f"Error processing transaction dataset: {e}")
         st.stop()
@@ -628,10 +639,13 @@ with tab3:
     st.subheader("🤖 Unsupervised Machine Learning (K-Means & PCA 3D)")
     st.caption("Normalized feature space ($\log(1+x)$ + StandardScaler) with dynamic Silhouette Optimization and 3D PCA projection.")
 
-    # Evaluate k=2 to k=7 with spinner
+    # Evaluate k=2 to k=7 on the SAME log1p + StandardScaler feature space used by the
+    # final K-Means fit below (perform_kmeans_clustering), so the Silhouette/Elbow curves
+    # and the recommended "optimal k" accurately reflect the model that actually gets fit —
+    # rather than a 3D PCA-reduced projection that discards one dimension of information.
     with st.spinner("🤖 Optimizing cluster partitions across k=2...7 via Silhouette scoring..."):
-        X_scaled, _, _ = cached_compute_pca_3d(clv_df)
-        eval_df = cached_evaluate_kmeans_candidates(X_scaled[["PCA_1", "PCA_2", "PCA_3"]].values, min_k=2, max_k=7)
+        X_scaled, _, _ = cached_preprocess_rfmt_features(clv_df)
+        eval_df = cached_evaluate_kmeans_candidates(X_scaled, min_k=2, max_k=7)
         optimal_k = int(eval_df.loc[eval_df["Silhouette_Score"].idxmax()]["k"])
 
     c_sel, c_opt = st.columns([2, 1])

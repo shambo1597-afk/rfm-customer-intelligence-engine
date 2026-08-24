@@ -9,6 +9,22 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
+# Columns every downstream engine (RFM-T, ML, CLV, Cohort) assumes are present
+# on the standardized transaction frame.
+REQUIRED_STANDARD_COLUMNS = ["CustomerID", "PurchaseDate", "TotalSpend"]
+
+
+class RFMPipelineError(ValueError):
+    """
+    Raised when the input transaction data cannot be standardized into the RFM-T
+    pipeline — e.g. required columns could not be identified, or no valid
+    transaction rows remain after cleaning. Callers (such as the Streamlit app)
+    can catch this specifically to surface an actionable message instead of a
+    raw pandas KeyError/AttributeError.
+    """
+    pass
+
+
 # 7-Segment Color Palette
 SEGMENT_COLORS = {
     "Champions": "#10B981",        # Vibrant Emerald
@@ -189,6 +205,25 @@ SEGMENT_PLAYBOOKS = {
 }
 
 
+def ensure_series(selection) -> pd.Series:
+    """
+    Coerces a raw `df[col]` selection to a plain 1D Series.
+
+    `df[col]` normally returns a Series, but returns a DataFrame instead if `col`
+    happens to match more than one column (e.g. a duplicate-named column in a
+    messy upload). This picks the first matching column in that case.
+
+    Deliberately NOT implemented with `Series.squeeze()`/`DataFrame.squeeze()`:
+    squeeze() also collapses a length-1 selection into a bare scalar, which
+    breaks every subsequent `.astype()`/`.fillna()` call once a dataset is down
+    to its last surviving row (a real, previously-uncaught crash on single-row
+    or heavily-filtered datasets).
+    """
+    if isinstance(selection, pd.DataFrame):
+        return selection.iloc[:, 0]
+    return selection
+
+
 def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> pd.DataFrame:
     """
     Standardizes transaction columns from various e-commerce schemas.
@@ -196,7 +231,7 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
     """
     df_clean = df.copy()
 
-    # 1. Robust 1D Series Extraction via custom_mapping and .squeeze()
+    # 1. Robust 1D Series Extraction via custom_mapping
     if custom_mapping:
         cust_col = custom_mapping.get("CustomerID")
         date_col = custom_mapping.get("PurchaseDate")
@@ -205,31 +240,31 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
         cat_col = custom_mapping.get("ProductCategory")
 
         if cust_col and cust_col in df_clean.columns:
-            df_clean["CustomerID"] = df_clean[cust_col].squeeze().astype(str)
+            df_clean["CustomerID"] = ensure_series(df_clean[cust_col]).astype(str)
         if date_col and date_col in df_clean.columns:
-            df_clean["PurchaseDate"] = pd.to_datetime(df_clean[date_col].squeeze(), errors="coerce")
+            df_clean["PurchaseDate"] = pd.to_datetime(ensure_series(df_clean[date_col]), errors="coerce")
         if spend_col and spend_col in df_clean.columns:
-            df_clean["TotalSpend"] = pd.to_numeric(df_clean[spend_col].squeeze(), errors="coerce")
+            df_clean["TotalSpend"] = pd.to_numeric(ensure_series(df_clean[spend_col]), errors="coerce")
         if invoice_col and invoice_col in df_clean.columns:
-            df_clean["InvoiceNo"] = df_clean[invoice_col].squeeze().astype(str)
+            df_clean["InvoiceNo"] = ensure_series(df_clean[invoice_col]).astype(str)
         if cat_col and cat_col in df_clean.columns:
-            df_clean["ProductCategory"] = df_clean[cat_col].squeeze().astype(str)
+            df_clean["ProductCategory"] = ensure_series(df_clean[cat_col]).astype(str)
 
     # Auto-detection for standard columns if not yet set
     for col in df_clean.columns:
         clean = col.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
         if "CustomerID" not in df_clean.columns and clean in ["customerid", "customer", "customerno", "clientid", "userid"]:
-            df_clean["CustomerID"] = df_clean[col].squeeze().astype(str)
+            df_clean["CustomerID"] = ensure_series(df_clean[col]).astype(str)
         elif "PurchaseDate" not in df_clean.columns and clean in ["purchasedate", "date", "invoicedate", "orderdate", "timestamp", "datetime"]:
-            df_clean["PurchaseDate"] = pd.to_datetime(df_clean[col].squeeze(), errors="coerce")
+            df_clean["PurchaseDate"] = pd.to_datetime(ensure_series(df_clean[col]), errors="coerce")
         elif "TotalSpend" not in df_clean.columns and clean in ["totalspend", "total", "spend", "amount", "sales", "revenue"]:
-            df_clean["TotalSpend"] = pd.to_numeric(df_clean[col].squeeze(), errors="coerce")
+            df_clean["TotalSpend"] = pd.to_numeric(ensure_series(df_clean[col]), errors="coerce")
         elif "InvoiceNo" not in df_clean.columns and clean in ["invoiceno", "invoice", "invoicenumber", "orderno", "orderid", "transactionid"]:
-            df_clean["InvoiceNo"] = df_clean[col].squeeze().astype(str)
+            df_clean["InvoiceNo"] = ensure_series(df_clean[col]).astype(str)
         elif "ProductCategory" not in df_clean.columns and clean in ["productcategory", "category", "itemcategory", "dept"]:
-            df_clean["ProductCategory"] = df_clean[col].squeeze().astype(str)
+            df_clean["ProductCategory"] = ensure_series(df_clean[col]).astype(str)
         elif "Product" not in df_clean.columns and clean in ["product", "productname", "item", "description", "sku"]:
-            df_clean["Product"] = df_clean[col].squeeze().astype(str)
+            df_clean["Product"] = ensure_series(df_clean[col]).astype(str)
 
     # Defaults for optional metadata fields
     if "InvoiceNo" not in df_clean.columns:
@@ -241,23 +276,34 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
     if "Quantity" not in df_clean.columns:
         df_clean["Quantity"] = 1
     else:
-        df_clean["Quantity"] = pd.to_numeric(df_clean["Quantity"].squeeze(), errors="coerce").fillna(1)
+        df_clean["Quantity"] = pd.to_numeric(ensure_series(df_clean["Quantity"]), errors="coerce").fillna(1)
 
     if "UnitPrice" not in df_clean.columns:
         if "TotalSpend" in df_clean.columns:
-            df_clean["UnitPrice"] = pd.to_numeric(df_clean["TotalSpend"].squeeze(), errors="coerce").fillna(0.0) / df_clean["Quantity"].replace(0, 1)
+            df_clean["UnitPrice"] = pd.to_numeric(ensure_series(df_clean["TotalSpend"]), errors="coerce").fillna(0.0) / df_clean["Quantity"].replace(0, 1)
         else:
             df_clean["UnitPrice"] = 25.0
     else:
-        df_clean["UnitPrice"] = pd.to_numeric(df_clean["UnitPrice"].squeeze(), errors="coerce").fillna(0.0)
+        df_clean["UnitPrice"] = pd.to_numeric(ensure_series(df_clean["UnitPrice"]), errors="coerce").fillna(0.0)
 
     if "TotalSpend" not in df_clean.columns:
         df_clean["TotalSpend"] = round(df_clean["Quantity"] * df_clean["UnitPrice"], 2)
 
+    # Fail fast with an actionable message rather than a downstream KeyError if a
+    # required field could not be resolved via custom_mapping or auto-detection.
+    missing_required = [c for c in REQUIRED_STANDARD_COLUMNS if c not in df_clean.columns]
+    if missing_required:
+        raise RFMPipelineError(
+            f"Could not identify required column(s) {missing_required} in the uploaded dataset. "
+            f"Available columns: {list(df.columns)}. Map them explicitly via custom_mapping, "
+            f"e.g. custom_mapping={{'CustomerID': 'your_id_column', 'PurchaseDate': 'your_date_column', "
+            f"'TotalSpend': 'your_amount_column'}}."
+        )
+
     # Convert core fields with safe 1D series extraction
-    df_clean["PurchaseDate"] = pd.to_datetime(df_clean["PurchaseDate"].squeeze(), errors="coerce")
-    df_clean["TotalSpend"] = pd.to_numeric(df_clean["TotalSpend"].squeeze(), errors="coerce")
-    df_clean["CustomerID"] = df_clean["CustomerID"].squeeze().astype(str).str.strip()
+    df_clean["PurchaseDate"] = pd.to_datetime(ensure_series(df_clean["PurchaseDate"]), errors="coerce")
+    df_clean["TotalSpend"] = pd.to_numeric(ensure_series(df_clean["TotalSpend"]), errors="coerce")
+    df_clean["CustomerID"] = ensure_series(df_clean["CustomerID"]).astype(str).str.strip()
 
     # Fast Data Ingestion & Cleaning: Drop null CustomerIDs, invalid dates, and non-positive transactions (Quantity > 0 and Spend > 0)
     df_clean = df_clean.dropna(subset=["CustomerID", "PurchaseDate", "TotalSpend"]).copy()
@@ -268,6 +314,13 @@ def standardize_transactions(df: pd.DataFrame, custom_mapping: dict = None) -> p
         (df_clean["TotalSpend"] > 0) &
         (df_clean["Quantity"] > 0)
     ].copy()
+
+    if df_clean.empty:
+        raise RFMPipelineError(
+            "No valid transactions remain after cleaning. Every row was dropped due to a "
+            "missing CustomerID/PurchaseDate/TotalSpend, an unparseable date, or a "
+            "non-positive TotalSpend/Quantity. Verify the column mapping and source data."
+        )
 
     return df_clean
 

@@ -10,6 +10,28 @@ Features:
 import numpy as np
 import pandas as pd
 
+# Empirical Bayesian smoothing priors for the per-day transaction rate (lambda).
+# alpha_prior/beta_prior act as a pseudo-count / pseudo-duration that pulls thin
+# purchase histories toward a plausible baseline cadence rather than an extreme
+# early estimate.
+DEFAULT_ALPHA_PRIOR = 1.2
+DEFAULT_BETA_PRIOR_DAYS = 60.0
+
+# Logistic churn-hazard coefficients. `churn_hazard` grows (pushing P(Alive) down)
+# as a customer misses more of their own expected purchase cycles, and as their
+# inactive time becomes a larger share of their total tenure. The *_offset terms
+# set the "on schedule" break-even point; the *_weight terms set how sharply the
+# hazard escalates once that point is crossed.
+HAZARD_MISSED_CYCLES_WEIGHT = 1.4
+HAZARD_MISSED_CYCLES_OFFSET = 1.8
+HAZARD_INACTIVITY_RATIO_WEIGHT = 1.2
+HAZARD_INACTIVITY_RATIO_OFFSET = 0.4
+
+# Churn Risk Tier P(Alive) cut points.
+CHURN_TIER_LOW_RISK_THRESHOLD = 0.75
+CHURN_TIER_MODERATE_THRESHOLD = 0.45
+
+
 def estimate_btyd_clv(
     rfmt_df: pd.DataFrame,
     prediction_horizon_days: int = 90,
@@ -35,20 +57,21 @@ def estimate_btyd_clv(
     
     # 1. Empirical Bayesian Transaction Rate (lambda) with smoothing
     # Baseline frequency per day
-    alpha_prior = 1.2
-    beta_prior = 60.0  # prior scale of 60 days
-    lambda_rate = (f + alpha_prior) / (t + beta_prior)  # expected purchases per day
-    
+    lambda_rate = (f + DEFAULT_ALPHA_PRIOR) / (t + DEFAULT_BETA_PRIOR_DAYS)  # expected purchases per day
+
     # 2. Expected purchase interval (in days)
     cadence = np.maximum(t / np.maximum(f, 1.0), 7.0)
-    
+
     # 3. Ratio of inactive days to expected cadence (missed purchasing cycles)
     missed_cycles = r / cadence
-    
+
     # 4. Probabilistic P(Alive) using logistic sigmoid decay based on missed cycles and tenure ratio
     # When customer is on schedule, P(Alive) is ~95-99%. As missed cycles grow beyond 2.5x, P(Alive) drops rapidly.
     inactivity_ratio = r / np.maximum(t, 1.0)
-    churn_hazard = 1.4 * (missed_cycles - 1.8) + 1.2 * (inactivity_ratio - 0.4)
+    churn_hazard = (
+        HAZARD_MISSED_CYCLES_WEIGHT * (missed_cycles - HAZARD_MISSED_CYCLES_OFFSET)
+        + HAZARD_INACTIVITY_RATIO_WEIGHT * (inactivity_ratio - HAZARD_INACTIVITY_RATIO_OFFSET)
+    )
     p_alive = 1.0 / (1.0 + np.exp(np.clip(churn_hazard, -10.0, 10.0)))
     
     # Bound P(Alive) gracefully in [0.02, 0.99]
@@ -61,9 +84,9 @@ def estimate_btyd_clv(
     
     # Churn Risk Tier
     conditions = [
-        df_clv["P_Alive"] >= 0.75,
-        (df_clv["P_Alive"] >= 0.45) & (df_clv["P_Alive"] < 0.75),
-        df_clv["P_Alive"] < 0.45
+        df_clv["P_Alive"] >= CHURN_TIER_LOW_RISK_THRESHOLD,
+        (df_clv["P_Alive"] >= CHURN_TIER_MODERATE_THRESHOLD) & (df_clv["P_Alive"] < CHURN_TIER_LOW_RISK_THRESHOLD),
+        df_clv["P_Alive"] < CHURN_TIER_MODERATE_THRESHOLD
     ]
     tiers = ["🟢 Low Churn Risk", "🟡 Moderate Watch", "🔴 High Churn Risk"]
     df_clv["Churn_Risk_Tier"] = np.select(conditions, tiers, default="🟡 Moderate Watch")
@@ -82,7 +105,7 @@ def estimate_btyd_clv(
     return df_clv
 
 
-def get_urgent_churn_watchlist(clv_df: pd.DataFrame, p_alive_threshold: float = 0.45) -> pd.DataFrame:
+def get_urgent_churn_watchlist(clv_df: pd.DataFrame, p_alive_threshold: float = CHURN_TIER_MODERATE_THRESHOLD) -> pd.DataFrame:
     """
     Identifies high historical spenders whose P(Alive) has fallen below the critical safety threshold.
     """

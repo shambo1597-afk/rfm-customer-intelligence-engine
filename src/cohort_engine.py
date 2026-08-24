@@ -8,12 +8,21 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
-def compute_monthly_cohort_matrix(df_transactions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+def compute_monthly_cohort_matrix(
+    df_transactions: pd.DataFrame,
+    max_months: int = 13
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
     """
     Groups transactions by monthly acquisition cohort and computes:
     1. Active Customer Count Matrix (Triangle): unique customer count per (CohortPeriod, CohortIndex)
     2. Retention Percentage Matrix (Triangle): retention rate relative to Month 0 cohort size (0% - 100%)
     3. Cohort Sizes (Series): initial unique customer count at acquisition Month 0
+
+    Parameters:
+    - max_months: Maximum number of cohort-index columns to retain (Month 0 through
+      Month max_months-1). Defaults to 13 (a full year of post-acquisition history
+      plus Month 0). Pass a larger value for longer-running datasets, or None for
+      no cap.
     """
     df = df_transactions.copy()
     df["PurchaseDate"] = pd.to_datetime(df["PurchaseDate"])
@@ -58,9 +67,9 @@ def compute_monthly_cohort_matrix(df_transactions: pd.DataFrame) -> tuple[pd.Dat
     retention_matrix = retention_matrix.clip(lower=0.0, upper=100.0).round(1)
     
     # Limit max columns shown if history is long (e.g. up to 13 columns: Month 0 to Month 12)
-    if retention_matrix.shape[1] > 13:
-        retention_matrix = retention_matrix.iloc[:, :13]
-        count_matrix = count_matrix.iloc[:, :13]
+    if max_months is not None and retention_matrix.shape[1] > max_months:
+        retention_matrix = retention_matrix.iloc[:, :max_months]
+        count_matrix = count_matrix.iloc[:, :max_months]
         
     return count_matrix, retention_matrix, cohort_sizes
 
