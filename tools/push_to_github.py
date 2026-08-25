@@ -1,5 +1,8 @@
 """
-push_to_github.py - Script to push project to GitHub remote origin main
+tools/push_to_github.py - Maintainer-only helper to push this project to its GitHub
+remote via a personal access token. NOT part of the RFM-T platform itself (app.py,
+src/*, generate_action_plan.py) and not required to install, run, or test the
+project — see the Installation section of README.md for the actual setup steps.
 """
 
 import sys
