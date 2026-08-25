@@ -5,7 +5,7 @@
 [![Machine Learning](https://img.shields.io/badge/Scikit--Learn-K--Means%20%7C%20PCA-F7931E.svg)](https://scikit-learn.org/)
 [![Visualization](https://img.shields.io/badge/Plotly-Interactive%203D-3F4F75.svg)](https://plotly.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/Tests-100%25%20Passing-brightgreen.svg)]()
+[![Test Suite](https://github.com/shambo1597-afk/rfm-customer-intelligence-engine/actions/workflows/test.yml/badge.svg)](https://github.com/shambo1597-afk/rfm-customer-intelligence-engine/actions/workflows/test.yml)
 
 An enterprise-grade, end-to-end customer intelligence platform designed to transform raw e-commerce transaction logs into high-precision behavioral segments, forward-looking lifetime value (CLV) forecasts, automated churn alerts, and data-driven marketing playbooks.
 
@@ -18,8 +18,10 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
    - [RFM-T Feature Engineering & Quintile Scoring](#1-rfm-t-feature-engineering--quintile-scoring)
    - [Feature Preprocessing & Skewness Mitigation](#2-feature-preprocessing--skewness-mitigation)
    - [Unsupervised Machine Learning: K-Means Clustering](#3-unsupervised-machine-learning-k-means-clustering)
+   - [ML Cluster vs. Segment Agreement: What the Clustering Step Is Actually For](#ml-cluster-vs-segment-agreement-what-the-clustering-step-is-actually-for)
    - [Dimensionality Reduction: 3D Principal Component Analysis (PCA)](#4-dimensionality-reduction-3d-principal-component-analysis-pca)
-   - [Probabilistic Buy-Till-You-Die (BTYD) CLV & Churn Radar](#5-probabilistic-buy-till-you-die-btyd-clv--churn-radar)
+   - [Heuristic Churn-Hazard Model (BTYD-Inspired) CLV & Churn Radar](#5-heuristic-churn-hazard-model-btyd-inspired-clv--churn-radar)
+   - [Configuring the Churn Hazard Model](#-configuring-the-churn-hazard-model)
    - [Monthly Acquisition Cohort Retention Triangle](#6-monthly-acquisition-cohort-retention-triangle)
 4. [Enterprise 7-Segment Taxonomy & Marketing Playbooks](#-enterprise-7-segment-taxonomy--marketing-playbooks)
 5. [What-If Campaign ROI Simulation Framework](#-what-if-campaign-roi-simulation-framework)
@@ -28,20 +30,23 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
 8. [Data Dictionary & Output Deliverables](#-data-dictionary--output-deliverables)
 9. [Installation & Quickstart Guide](#-installation--quickstart-guide)
 10. [Automated Testing Suite](#-automated-testing-suite)
-11. [Strategic Business Use Cases](#-strategic-business-use-cases)
+11. [Model Validation & Backtest Results](#-model-validation--backtest-results)
+12. [Strategic Business Use Cases](#-strategic-business-use-cases)
 
 ---
 
 ## 🌟 Executive Summary & Core Capabilities
 
-Modern customer retention requires moving beyond static, backward-looking metrics toward predictive customer modeling. This platform integrates **deterministic behavioral scoring (RFM-T)** with **unsupervised machine learning (K-Means + 3D PCA)** and **probabilistic modeling (Buy-Till-You-Die CLV & Churn Radar)** to provide a 360-degree view of customer health.
+Modern customer retention requires moving beyond static, backward-looking metrics toward predictive customer modeling. This platform integrates **deterministic behavioral scoring (RFM-T)** with **unsupervised machine learning (K-Means + 3D PCA)** and a **heuristic, BTYD-inspired churn-hazard model (CLV & Churn Radar)** to provide a 360-degree view of customer health.
+
+The K-Means/PCA path and the rule-based 7-segment taxonomy are two independently-computed views of the same customers — a hand-tuned rule system and an unsupervised one. They are cross-checked against each other (not merged into a single output) via the Segment × ML Cluster agreement matrix in the "Unsupervised ML Clustering" tab: where the two disagree substantially, that's a signal the quintile-rule thresholds may need revisiting, and it's also a sanity check against clusters that are just an artifact of K-Means (see [below](#ml-cluster-vs-segment-agreement-what-the-clustering-step-is-actually-for) for what this is and isn't used for).
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                               CORE PLATFORM CAPABILITIES                               │
 ├──────────────────────────┬──────────────────────────┬──────────────────────────────────┤
 │ 📐 RFM-T Scoring Engine  │ 🤖 Unsupervised ML & 3D  │ 🔮 Predictive CLV & Churn Radar  │
-│ 1-5 rank quintiles for   │ Log-transform, Standard- │ Empirical Bayesian rates,        │
+│ 1-5 rank quintiles for   │ Log-transform, Standard- │ Laplace-smoothed rates,          │
 │ Recency, Frequency,      │ Scaler, Elbow/Silhouette │ logistic hazard decay,           │
 │ Monetary, & Tenure with  │ optimization, and 3D     │ P(Alive) estimation, and 90-day  │
 │ 7-segment taxonomy.      │ spatial PCA projection.  │ forward revenue forecasting.     │
@@ -71,7 +76,7 @@ flowchart TD
     F --> G[K-Means Cluster Optimization<br/>Elbow Inertia & Silhouette Optimization]
     F --> H[3D Principal Component Analysis<br/>Eigen-decomposition of Covariance Matrix]
     
-    C --> I[Probabilistic BTYD Engine<br/>Empirical Bayes λ & Purchase Cadence]
+    C --> I[Heuristic BTYD-Inspired Engine<br/>Laplace-Smoothed λ & Purchase Cadence]
     I --> J[Logistic Hazard Churn Radar<br/>P Alive Estimation & Churn Risk Tiers]
     J --> K[90-Day Revenue & Net CLV Forecast<br/>Expected Orders × AOV × Gross Margin]
     
@@ -153,6 +158,17 @@ Where:
 
 $$\text{Optimal } K^* = \arg\max_{k \in [2, 7]} \left( \frac{1}{N}\sum_{i=1}^N s(i) \right)$$
 
+### ML Cluster vs. Segment Agreement: What the Clustering Step Is Actually For
+
+K-Means and the 7-segment rule taxonomy ([§4 below](#-enterprise-7-segment-taxonomy--marketing-playbooks)) are computed **completely independently**: the rules have no knowledge of the clustering, and K-Means has no knowledge of the rules. Left at that, `ML_Cluster` would just be parallel decoration — a label every customer gets that nothing else in the platform reads.
+
+Instead, `compute_segment_cluster_crosstab()` (`src/ml_engine.py`) cross-tabulates the two, and the **"Unsupervised ML Clustering"** tab surfaces it as a heatmap (`Segment` rows, each normalized to 100% of that segment's customers, `ML_Cluster` columns). This is a validation tool, not a merge into a new label:
+
+- **Segments landing overwhelmingly in one cluster** corroborate the rule-based thresholds — the hand-picked RFM-T quintile cutoffs and the unsupervised algorithm agree there's a real behavioral grouping there.
+- **Segments that split across multiple clusters** are a concrete signal that a quintile boundary may be cutting across a natural grouping rather than following one, and are worth revisiting.
+
+On the bundled synthetic dataset ($k=3$, via `python generate_action_plan.py`), most segments agree strongly with one cluster (Champions, Can't Lose Them: 100%; At-Risk VIPs: 99%; New Customers: 100% — each landing almost entirely in a single cluster) — but **Potential Growth splits 38% / 62%** across two clusters, and **Hibernating splits 22% / 76% / 2%** across all three. That's the crosstab doing its job: it's telling you those two segments' quintile cutoffs cut across boundaries K-Means finds naturally, which is exactly the kind of thing worth investigating before trusting those segments' marketing playbooks at face value. Re-run `python generate_action_plan.py` for the current numbers on your data — they will differ from a synthetic-data snapshot.
+
 ---
 
 ### 4. Dimensionality Reduction: 3D Principal Component Analysis (PCA)
@@ -171,16 +187,18 @@ To project the 4-dimensional normalized feature space into a visually interpreta
 4. **Spatial Projection**:
    $$\mathbf{P}_{3D} = \mathbf{Z} \mathbf{W}_3 \in \mathbb{R}^{N \times 3}, \quad \text{where } \mathbf{W}_3 = [\mathbf{v}_1, \mathbf{v}_2, \mathbf{v}_3] \in \mathbb{R}^{4 \times 3}$$
 
-Across our dataset, the top 3 components explain **$>98\%$** of the total variance, ensuring high-fidelity spatial representation without information loss.
+Across our dataset, the top 3 components explain **$>98\%$** of the total variance (PC1: 57.9%, PC2: 35.2%, PC3: 5.2%).
+
+**This is a smaller win than ">98% of 4 dimensions" sounds like.** Frequency and Monetary correlate at **$r \approx 0.87$** on the raw synthetic dataset (rising to **$r \approx 0.92$** in the actual log1p + StandardScaler space PCA/K-Means run on — customers who order often are, unsurprisingly, mostly the same customers who spend a lot). With one of the 4 input dimensions substantially redundant, PC1 + PC2 alone already capture 93.1% of the variance; PC3 contributes only 5.2% on top of that. Mechanically, the 4D RFM-T feature space here is closer to **2.5–3 truly independent dimensions**, not 4 — so K-Means and the 3D PCA projection are largely separating customers along a *recency* axis and a combined *spend-frequency-and-tenure* axis, rather than 4 orthogonal behavioral signals. That doesn't invalidate the clustering (correlated-but-not-identical features still carry real information, and PCA handles the redundancy correctly), but it's a more honest read of what ">98% variance explained" is actually buying you here.
 
 ---
 
-### 5. Probabilistic Buy-Till-You-Die (BTYD) CLV & Churn Radar
+### 5. Heuristic Churn-Hazard Model (BTYD-Inspired) CLV & Churn Radar
 
-To forecast future transaction behavior and detect churn risk before permanent customer defection, the platform implements a continuous-time probabilistic model:
+To forecast future transaction behavior and flag churn risk before permanent customer defection, the platform implements a **heuristic, rule-based hazard function** — inspired by the shape of continuous-time Buy-Till-You-Die (BTYD / BG-NBD) models, but *not* a fitted probabilistic model in the statistical sense (no likelihood is maximized, no posterior is estimated). The formula's constants (§D below) are fixed, hand-tuned defaults — see [Model Validation](#-model-validation--backtest-results) for how well this actually performs against real held-out data, and [Configuring the Churn Hazard Model](#-configuring-the-churn-hazard-model) for how to recalibrate them.
 
-#### A. Empirical Bayesian Transaction Rate ($\lambda$)
-Customer purchase velocity is estimated using conjugate Gamma prior smoothing:
+#### A. Laplace-Smoothed Transaction Rate ($\lambda$)
+Customer purchase velocity uses fixed additive (Laplace-style) smoothing constants — not a fitted Bayesian posterior — to avoid extreme estimates for customers with only one or two orders:
 
 $$\lambda_i = \frac{F_i + \alpha_{\text{prior}}}{T_i + \beta_{\text{prior}}} \quad \left[\text{orders per day}\right]$$
 
@@ -220,6 +238,28 @@ $$\text{Predicted Spend}_{i, 90d} = \mathbb{E}[N_{i, 90d}] \cdot \text{AOV}_i$$
 
 $$\text{Predictive CLV}_{i, 90d} = \text{Predicted Spend}_{i, 90d} \times g$$
 
+### ⚙️ Configuring the Churn Hazard Model
+
+Every constant in §A–D above ($\alpha_{\text{prior}}$, $\beta_{\text{prior}}$, and the four churn-hazard weight/offset terms) is a **manually-tuned default calibrated to look reasonable on this project's synthetic dataset** — not a value derived from real churn outcomes. [Model Validation](#-model-validation--backtest-results) shows exactly how that plays out: decent on synthetic data, mediocre-to-poor on the real UCI dataset. They are not hardcoded module-level constants only — `estimate_btyd_clv()` (`src/clv_engine.py`) exposes all six as function parameters, defaulting to the module constants, specifically so a real deployment can recalibrate them against its own known-outcome data:
+
+```python
+from src.clv_engine import estimate_btyd_clv
+
+clv_df = estimate_btyd_clv(
+    rfmt_df,
+    prediction_horizon_days=90,
+    gross_margin=0.35,
+    alpha_prior=1.2,                        # lambda smoothing: pseudo-count
+    beta_prior_days=60.0,                   # lambda smoothing: pseudo-duration (days)
+    hazard_missed_cycles_weight=1.4,        # churn hazard: missed-cycles scale
+    hazard_missed_cycles_offset=1.8,        # churn hazard: missed-cycles break-even
+    hazard_inactivity_ratio_weight=1.2,     # churn hazard: inactivity-ratio scale
+    hazard_inactivity_ratio_offset=0.4,     # churn hazard: inactivity-ratio break-even
+)
+```
+
+To actually recalibrate rather than guess: run `backtest_clv.py` (or a longer-horizon variant of it) against your own historical data with several candidate values for each constant, and keep whichever combination minimizes MAE/RMSE on the held-out window and improves churn-flag precision/recall — the same evaluation the "Model Validation" section above uses to report the current defaults' (mediocre) real-world performance.
+
 ---
 
 ### 6. Monthly Acquisition Cohort Retention Triangle
@@ -252,6 +292,18 @@ Customers are categorized into seven strategic segments based on multi-criteria 
 | **Hibernating** | 💤 | $R \le 2, F \le 2, M \le 2$ | Low frequency, low spend, inactive for $>200$ days. | Low-cost liquidation or email deliverability hygiene. | Automated Re-permission, Social | Seasonal clearance blasts (up to 40% off), opt-out sunset. |
 | **New Customers** | 🌱 | $T \le 65\text{d}, R \ge 4, F \le 2$ | Joined recently ($<60$ days) with 1–2 orders. High receptivity. | Onboard smoothly, guide product usage, secure 2nd order. | Onboarding Email Series, SMS | Welcome gift (\$15 off within 21 days), quick-start guide. |
 
+**Rule precedence.** Several of the criteria above overlap by design (e.g. At-Risk VIPs and Can't Lose Them can both match the same customer). `assign_segments_vectorized()` (`src/rfm_engine.py`) resolves this via `numpy.select`, which is **first-match-wins**, evaluated in this exact order — *not* the value-tier display order of the table above:
+
+1. **New Customers** — checked first: its condition is deliberately allowed to override anything else so a customer's very first purchase isn't misclassified as an established Champion just because it happened to be large.
+2. **Champions**
+3. **Can't Lose Them** — checked before At-Risk VIPs because $R = 1$ (completely dormant) is a strict subset of At-Risk VIPs' $R \le 2$, and is the more urgent case.
+4. **At-Risk VIPs**
+5. **Potential Growth**
+6. **Loyalists**
+7. **Hibernating** — the default: every customer matching none of the above rules.
+
+Concretely: a customer with $R = 1, F \ge 4$ satisfies both At-Risk VIPs ($R \le 2$) and Can't Lose Them ($R = 1$) — they are deterministically assigned **Can't Lose Them**, the earlier rule in evaluation order, never both and never a table-order tiebreak.
+
 ---
 
 ## 💰 What-If Campaign ROI Simulation Framework
@@ -276,61 +328,66 @@ $$\text{Cost Per Converted Order (CPA)} = \frac{\text{Campaign Budget}}{\max(\te
 
 ## 🖥️ Interactive Streamlit Command Center Overview
 
-The application (`app.py`) provides an interactive interface organized into 6 functional tabs:
+The application (`app.py`) shows a global KPI banner — Total Customers, Active Rate ($P(\text{Alive}) \ge 50\%$), Realized Lifetime Revenue, 90-Day Forecasted Revenue, Average Customer Tenure — above **5 functional tabs**:
 
-1. **📊 Executive KPI Command Center & Revenue Distributions**:
-   - High-level KPIs: Total Customer Base, Active Rate ($P(\text{Alive}) \ge 50\%$), Realized Lifetime Revenue, 90-Day Projected Revenue Pipeline, Average Customer Tenure.
-   - Dual-axis interactive distributions: Revenue Share vs. Customer Count Share by segment.
-   - Segment Treemap visualizing monetary volume partitioned by average order value.
-   - RFM-T Metric Correlation Heatmap and Scatter Matrix.
+1. **📊 Executive KPI & Cohort Matrix**:
+   - Monthly acquisition cohort retention triangle (interactive Plotly heatmap), capped at 13 cohort-index columns by default (`compute_monthly_cohort_matrix(..., max_months=13)`, configurable).
+   - Average Customer Retention Decay curve, plus Month 1 / Month 3 / Month 6 retention benchmarks.
 
-2. **👑 RFM-T 7-Segment Deep Dive & Customer Search**:
-   - Dynamic segment filtering, multi-attribute sorting, and real-time customer lookup.
-   - Full KPI summary table with revenue contributions and average order metrics.
+2. **🎯 RFM-T Rule Segmentation**:
+   - Segment Revenue & Volume Hierarchy Treemap and a Customer Volume vs. Revenue Contribution donut chart.
+   - Full segment performance benchmark table (customer/revenue share, average recency/frequency/tenure/AOV per segment).
 
-3. **🤖 Unsupervised Machine Learning (K-Means & 3D PCA)**:
-   - Interactive $K$ selector ($k=2$ to $k=7$) with automated Silhouette Score recommendation.
+3. **🤖 Unsupervised ML Clustering**:
+   - Interactive $K$ selector ($k=2$ to $k=7$) with automated Silhouette Score recommendation, computed on the same log1p + StandardScaler feature space the final K-Means fit uses.
    - Dual diagnostic charts: Silhouette Score Curve & Elbow Inertia Decay.
-   - **Interactive 3D WebGL Scatter Plot**: Rotate, pan, and inspect customer points in 3D PCA coordinate space colored by ML cluster and sized by spend.
+   - **Interactive 3D WebGL Scatter Plot**: rotate, pan, and inspect customer points in 3D PCA coordinate space, colored by ML cluster and sized by spend.
+   - **Segment × ML Cluster agreement matrix** — see [below](#ml-cluster-vs-segment-agreement-what-the-clustering-step-is-actually-for) for what it's for.
 
-4. **🔮 Probabilistic CLV & Urgent Churn Radar**:
-   - $P(\text{Alive})$ distribution histogram and Churn Risk Tier categorization.
-   - **Urgent Churn Watchlist**: High-historical spenders in active defection risk ($P(\text{Alive}) < 0.45$).
-   - Top 90-Day Forward Revenue Growth Targets.
+4. **🔮 Predictive CLV & Churn Radar**:
+   - $P(\text{Alive})$ distribution histogram and Churn Risk Tier breakdown ($P(\text{Alive}) \ge 0.75$ / $0.45$–$0.75$ / $< 0.45$).
+   - Historical Spend vs. 90-Day Forecasted Revenue scatter, colored by segment.
+   - **Urgent Churn Watchlist**: above-median historical spenders with $P(\text{Alive}) < 0.45$, with CSV export.
 
-5. **📅 Monthly Acquisition Cohort Retention Triangle**:
-   - Interactive Plotly Heatmap showing retention percentages and active customer counts for up to 24 monthly acquisition cohorts.
-   - Average Customer Retention Decay curve benchmarking long-term product-market fit.
+5. **💰 What-If ROI Simulator & Playbook**:
+   - Interactive financial sliders: target segment, audience reach, campaign budget, conversion rate, gross margin.
+   - Real-time projected revenue, net incremental profit, ROI %, and cost per converted order.
+   - Segment-specific playbook card with recommended channel/promotion, action items, and a ready-to-use campaign copy blueprint.
+   - CSV export of the targeted audience list.
 
-6. **🎯 Targeted Marketing Playbooks & What-If ROI Simulator**:
-   - Interactive financial sliders: Budget, Reach, Conversion Rate, and Product Margin.
-   - Real-time calculations of Net Profit, Campaign ROI, and CPA.
-   - Segment-specific playbook cards with pre-written subject lines, copy blueprints, and CTAs.
-   - Direct CSV export for targeted audience lists.
+*(Two figures above the tabs — the full-intelligence CSV export button and the KPI banner — are not tab-scoped; they reflect whatever dataset/column-mapping/snapshot-date is currently selected in the sidebar.)*
 
 ---
 
 ## 📂 Repository Structure
 
 ```
-Customer_RFM_Segmentation/
-├── app.py                             # Main Streamlit Enterprise Dashboard (6 tabs, glassmorphic UI)
+rfm-customer-intelligence-engine/
+├── app.py                             # Main Streamlit Enterprise Dashboard (5 tabs, glassmorphic UI)
+├── backtest_clv.py                    # Out-of-sample validation of CLV forecasts & churn flags
 ├── customer_segmentation_action_plan.csv # Deliverable: 450 customers × 34 enriched attributes
 ├── data/
-│   └── ecommerce_transactions.csv     # Enterprise dataset (5,550 transactions across 450 customers)
+│   ├── ecommerce_transactions.csv     # Enterprise dataset (5,550 transactions across 450 customers)
+│   └── real_online_retail.csv.gz      # Authentic UCI Online Retail dataset (397K transactions)
 ├── generate_action_plan.py            # Automated batch execution script for CSV deliverable
 ├── generate_data.py                   # Synthetic transaction data generator (24-month horizon)
+├── LICENSE                            # MIT License
 ├── README.md                          # Platform documentation
 ├── requirements.txt                   # Production Python dependencies
+├── requirements-dev.txt               # Dev/test dependencies (pytest, pytest-cov)
 ├── run_app.bat                        # One-click Windows startup batch script
 ├── sample_transactions.csv            # Compatibility transaction dataset
 ├── src/
 │   ├── __init__.py                    # Module export definitions
-│   ├── clv_engine.py                  # Probabilistic BTYD P(Alive), 90d CLV, & Churn Radar
+│   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
 │   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
 │   ├── ml_engine.py                   # Log-transform, StandardScaler, K-Means & 3D PCA decomposition
 │   └── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
-└── test_enterprise_pipeline.py       # Automated testing suite (100% test coverage across 5 engines)
+├── tests/
+│   └── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
+├── test_enterprise_pipeline.py        # Standalone regression script covering all 5 engines
+└── tools/
+    └── push_to_github.py              # Maintainer-only publish helper (not part of the platform)
 ```
 
 ---
@@ -345,7 +402,7 @@ The deliverable `customer_segmentation_action_plan.csv` contains customer-level 
 | `Segment` | String | Enterprise segment classification (`Champions`, `Loyalists`, `At-Risk VIPs`, etc.) |
 | `ML_Cluster` | String | Unsupervised K-Means cluster assignment (`Cluster 1`, `Cluster 2`, `Cluster 3`) |
 | `Churn_Risk_Tier` | String | Categorical risk band (`🟢 Low Churn Risk`, `🟡 Moderate Watch`, `🔴 High Churn Risk`) |
-| `P_Alive_Pct` | Float | Probabilistic BTYD likelihood that customer remains active ($0.0\% - 100.0\%$) |
+| `P_Alive_Pct` | Float | Heuristic BTYD-inspired estimate that customer remains active ($0.0\% - 100.0\%$) — see [Model Validation](#-model-validation--backtest-results) |
 | `Churn_Risk_Pct` | Float | Inverted churn probability ($100.0 - P(\text{Alive})$) |
 | `Recency` | Integer | Elapsed days between reference date and most recent purchase |
 | `Frequency` | Integer | Total number of distinct completed orders |
@@ -380,8 +437,8 @@ The deliverable `customer_segmentation_action_plan.csv` contains customer-level 
 ### 1. Clone & Setup Environment
 ```bash
 # Clone repository
-git clone https://github.com/your-org/Customer_RFM_Segmentation.git
-cd Customer_RFM_Segmentation
+git clone https://github.com/shambo1597-afk/rfm-customer-intelligence-engine.git
+cd rfm-customer-intelligence-engine
 
 # Create virtual environment
 python -m venv venv
@@ -419,18 +476,78 @@ The dashboard will open automatically in your browser at `http://localhost:8501`
 
 ## 🧪 Automated Testing Suite
 
-The repository includes a test suite (`test_enterprise_pipeline.py`) validating all 5 calculation engines:
+The repository has two complementary test layers, both run automatically on every push/PR by [GitHub Actions](.github/workflows/test.yml) (see the Build badge at the top of this README for current status):
+
+**1. Standalone regression script** (`test_enterprise_pipeline.py`) — a fast, dependency-free end-to-end smoke test across all 5 engines plus input validation:
 
 ```bash
 python test_enterprise_pipeline.py
 ```
 
-**Test Coverage Summary**:
-1. `[1/5] Data Generation`: Verifies row volume, schema integrity, and customer cardinality.
-2. `[2/5] RFM-T Engine`: Verifies quintile scoring, null checks, and 7-segment taxonomy mapping.
-3. `[3/5] Machine Learning Engine`: Tests multi-k Silhouette evaluations, K-Means convergence, and 3D PCA variance.
-4. `[4/5] CLV & Churn Radar Engine`: Validates continuous $P(\text{Alive}) \in [0.02, 0.99]$, forward revenue math, and churn watchlist filters.
-5. `[5/5] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, and 100% Month 0 retention identity.
+1. `[1/6] Data Generation`: Verifies row volume, schema integrity, and customer cardinality.
+2. `[2/6] RFM-T Engine`: Verifies quintile scoring, null checks, and 7-segment taxonomy mapping.
+3. `[3/6] Machine Learning Engine`: Tests multi-k Silhouette evaluations, K-Means convergence, 3D PCA variance, and that candidate-k evaluation uses the same feature space as the final fit.
+4. `[4/6] CLV & Churn Radar Engine`: Validates continuous $P(\text{Alive}) \in [0.02, 0.99]$, forward revenue math, and churn watchlist filters.
+5. `[5/6] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, 100% Month 0 retention identity, and the configurable month cap.
+6. `[6/6] Input Validation & Error Handling`: Confirms unmappable columns, all-rows-filtered datasets, and single-row datasets are all handled correctly (no crash, or a clear `RFMPipelineError`).
+
+**2. `pytest` suite** (`tests/test_pipeline.py`) — function-level unit tests with measured coverage:
+
+```bash
+pip install -r requirements-dev.txt
+pytest --cov=src --cov-report=term-missing
+```
+
+Current measured coverage (`pytest-cov`, `src/` only — re-run the command above for a fresh number, and see the `coverage-report` artifact on the [CI workflow](.github/workflows/test.yml) for the number on the current commit):
+
+| Module | Statements | Coverage |
+|:---|---:|---:|
+| `src/clv_engine.py` | 42 | 100% |
+| `src/cohort_engine.py` | 56 | 100% |
+| `src/ml_engine.py` | 59 | 98% |
+| `src/rfm_engine.py` | 155 | 94% |
+| **Total** | **312** | **97%** |
+
+*(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
+
+---
+
+## 🔬 Model Validation & Backtest Results
+
+Everything above this section describes what the platform *computes*. This section reports whether those numbers are actually *predictive* — checked against real held-out outcomes, not asserted. Run it yourself:
+
+```bash
+python backtest_clv.py --dataset data/ecommerce_transactions.csv
+python backtest_clv.py --dataset data/real_online_retail.csv.gz
+```
+
+**Method** (`backtest_clv.py`): pick a cutoff date $C = T - 90\text{d}$ (where $T$ is the last transaction date in the dataset). Compute RFM-T + the CLV forecast using *only* transactions on or before $C$, exactly as if $C$ were "today." Then compare the forecast against what those customers *actually* did in the 90 days after $C$ — a genuine temporal train/test split, not a check against the same data the model was fit on. Two naive baselines are computed the same out-of-sample way: predicting each customer repeats their own trailing 90-day spend, and predicting every customer gets the population-average trailing spend.
+
+### Results on the synthetic dataset (`ecommerce_transactions.csv`, 384 backtested customers)
+
+| Forecast method | MAE ($) | RMSE ($) |
+|:---|---:|---:|
+| **Model** (`Predicted_Spend_90d`) | **752.61** | **1,172.77** |
+| Baseline: trailing 90-day spend | 912.36 | 1,485.98 |
+| Baseline: population mean | 966.68 | 1,265.96 |
+
+✅ The model beats both naive baselines on MAE here.
+
+Churn flag ($P(\text{Alive}) < 0.45$) vs. actually making zero purchases in the window: **74.6% precision, 47.5% recall** (base churn rate in this window: 46.6%; the model flagged 29.7% of customers).
+
+### Results on the real UCI Online Retail dataset (`real_online_retail.csv.gz`, 3,370 backtested customers)
+
+| Forecast method | MAE ($) | RMSE ($) |
+|:---|---:|---:|
+| Model (`Predicted_Spend_90d`) | 682.05 | 4,232.38 |
+| **Baseline: trailing 90-day spend** | **657.56** | **4,054.82** |
+| Baseline: population mean | 910.68 | 5,015.35 |
+
+⚠️ **On real transaction data, the model does *not* beat the simplest baseline** (predicting each customer repeats their own last 90 days) on either MAE or RMSE — it's close, but the trailing-spend baseline wins. Reported honestly rather than omitted: the log1p/StandardScaler-derived hazard formula (see [Section 5](#5-heuristic-churn-hazard-model-btyd-inspired-clv--churn-radar)) was hand-tuned for plausible-looking output on the synthetic dataset, not fit against real outcomes, and it shows here.
+
+Churn flag on real data: **48.4% precision, 10.3% recall** (base churn rate: 43.0%; the model flagged only 9.1% of customers as high-risk). Precision beats the base rate, but recall is poor — the flag misses roughly 9 out of 10 customers who actually go quiet. The fixed hazard-formula constants (`HAZARD_MISSED_CYCLES_WEIGHT`, etc. in `src/clv_engine.py` — see [Section 3.3 below](#-configuring-the-churn-hazard-model)) are the most likely lever to improve this; they are exposed as function parameters specifically so a real deployment can recalibrate them against its own outcomes rather than trusting the synthetic-data defaults.
+
+**Bottom line**: treat `Predicted_Spend_90d` and the churn flag as a reasonable, cheap-to-compute *prioritization signal* (worth acting on directionally — e.g., ranking who to contact first) rather than a precise forecast. On real data it does not outperform "assume next quarter looks like last quarter," and it misses most true churners. That's a materially different (and more honest) claim than "predictive BTYD CLV," and worth knowing before using these numbers to size a budget or a headcount decision.
 
 ---
 

@@ -25,7 +25,8 @@ from src.ml_engine import (
     preprocess_rfmt_features,
     evaluate_kmeans_candidates,
     perform_kmeans_clustering,
-    compute_pca_3d
+    compute_pca_3d,
+    compute_segment_cluster_crosstab
 )
 from src.clv_engine import (
     estimate_btyd_clv,
@@ -737,6 +738,30 @@ with tab3:
 
     st.markdown("### 📊 ML Cluster Profiling Matrix")
     st.dataframe(cluster_summary, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("🔎 Segment × ML Cluster Agreement")
+    st.caption(
+        "The 7-segment rule taxonomy and this K-Means clustering are computed completely "
+        "independently — neither one knows about the other. This crosstab is a sanity check "
+        "on the rule thresholds, not a merge into a new label: where a segment's customers land "
+        "overwhelmingly in one cluster, that corroborates the rule boundaries; where a segment "
+        "splits roughly evenly across clusters, its quintile thresholds may be cutting across a "
+        "real behavioral grouping and could be worth revisiting."
+    )
+    seg_cluster_counts, seg_cluster_pct = compute_segment_cluster_crosstab(df_clustered)
+    fig_crosstab = px.imshow(
+        seg_cluster_pct,
+        text_auto=".0f",
+        color_continuous_scale="Blues",
+        labels=dict(x="ML Cluster", y="Segment", color="% of Segment"),
+        template="plotly_dark",
+        aspect="auto"
+    )
+    fig_crosstab.update_layout(height=360, margin=dict(l=20, r=20, t=30, b=20))
+    st.plotly_chart(fig_crosstab, use_container_width=True)
+    with st.expander("View raw Segment × ML Cluster customer counts"):
+        st.dataframe(seg_cluster_counts, use_container_width=True)
 
 
 # -------------------------------------------------------------------------------------------------

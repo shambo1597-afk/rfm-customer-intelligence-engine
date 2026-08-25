@@ -35,29 +35,55 @@ CHURN_TIER_MODERATE_THRESHOLD = 0.45
 def estimate_btyd_clv(
     rfmt_df: pd.DataFrame,
     prediction_horizon_days: int = 90,
-    gross_margin: float = 0.35
+    gross_margin: float = 0.35,
+    alpha_prior: float = DEFAULT_ALPHA_PRIOR,
+    beta_prior_days: float = DEFAULT_BETA_PRIOR_DAYS,
+    hazard_missed_cycles_weight: float = HAZARD_MISSED_CYCLES_WEIGHT,
+    hazard_missed_cycles_offset: float = HAZARD_MISSED_CYCLES_OFFSET,
+    hazard_inactivity_ratio_weight: float = HAZARD_INACTIVITY_RATIO_WEIGHT,
+    hazard_inactivity_ratio_offset: float = HAZARD_INACTIVITY_RATIO_OFFSET,
 ) -> pd.DataFrame:
     """
-    Computes probabilistic BTYD P(Alive), 90-day expected purchase frequency,
+    Computes a heuristic, BTYD-inspired P(Alive), 90-day expected purchase frequency,
     and 90-day predicted CLV for each customer.
-    
+
+    IMPORTANT: this is not a fitted probabilistic model (no likelihood maximization, no
+    posterior estimation) — it's a hand-tuned logistic hazard function shaped after BTYD
+    models. The alpha_prior/beta_prior_days/hazard_* defaults below were calibrated to
+    produce plausible-looking P(Alive) distributions on this project's synthetic dataset,
+    not fit against real churn outcomes. See backtest_clv.py and the README's "Model
+    Validation" section for out-of-sample accuracy numbers (they are mediocre-to-poor on
+    real transaction data) and treat every value as a *deployment-specific calibration
+    target*, not a universal constant. All six are exposed as parameters (rather than
+    only module-level constants) specifically so a real deployment can recalibrate them
+    against its own known-outcome data instead of trusting these synthetic-data defaults.
+
     Parameters:
     - rfmt_df: DataFrame containing CustomerID, Recency, Frequency, Monetary, Tenure, AvgOrderValue
     - prediction_horizon_days: Forecast period in days (default 90 days)
     - gross_margin: Assumed product gross profit margin (default 35%)
+    - alpha_prior, beta_prior_days: Laplace-style smoothing constants for the per-day
+      transaction rate lambda = (Frequency + alpha_prior) / (Tenure + beta_prior_days).
+      Larger beta_prior_days pulls thin purchase histories harder toward a low baseline
+      rate; larger alpha_prior raises that baseline.
+    - hazard_missed_cycles_weight, hazard_missed_cycles_offset: scale and break-even
+      point (in multiples of a customer's own expected purchase cadence) for the
+      "missed cycles" term of the churn hazard.
+    - hazard_inactivity_ratio_weight, hazard_inactivity_ratio_offset: scale and
+      break-even point (as a fraction of tenure) for the "inactivity ratio" term.
     """
     df_clv = rfmt_df.copy()
-    
+
     # Recency (days since last purchase), Tenure (days since first purchase)
     r = df_clv["Recency"].astype(float).values
     t = df_clv["Tenure"].astype(float).values
     f = df_clv["Frequency"].astype(float).values
     m = df_clv["Monetary"].astype(float).values
     aov = df_clv["AvgOrderValue"].astype(float).values
-    
-    # 1. Empirical Bayesian Transaction Rate (lambda) with smoothing
-    # Baseline frequency per day
-    lambda_rate = (f + DEFAULT_ALPHA_PRIOR) / (t + DEFAULT_BETA_PRIOR_DAYS)  # expected purchases per day
+
+    # 1. Laplace-smoothed transaction rate (lambda) — fixed additive smoothing constants,
+    #    not a fitted Bayesian posterior. Baseline frequency per day.
+    lambda_rate = (f + alpha_prior) / (t + beta_prior_days)  # expected purchases per day
 
     # 2. Expected purchase interval (in days)
     cadence = np.maximum(t / np.maximum(f, 1.0), 7.0)
@@ -65,12 +91,12 @@ def estimate_btyd_clv(
     # 3. Ratio of inactive days to expected cadence (missed purchasing cycles)
     missed_cycles = r / cadence
 
-    # 4. Probabilistic P(Alive) using logistic sigmoid decay based on missed cycles and tenure ratio
+    # 4. Heuristic P(Alive) using logistic sigmoid decay based on missed cycles and tenure ratio.
     # When customer is on schedule, P(Alive) is ~95-99%. As missed cycles grow beyond 2.5x, P(Alive) drops rapidly.
     inactivity_ratio = r / np.maximum(t, 1.0)
     churn_hazard = (
-        HAZARD_MISSED_CYCLES_WEIGHT * (missed_cycles - HAZARD_MISSED_CYCLES_OFFSET)
-        + HAZARD_INACTIVITY_RATIO_WEIGHT * (inactivity_ratio - HAZARD_INACTIVITY_RATIO_OFFSET)
+        hazard_missed_cycles_weight * (missed_cycles - hazard_missed_cycles_offset)
+        + hazard_inactivity_ratio_weight * (inactivity_ratio - hazard_inactivity_ratio_offset)
     )
     p_alive = 1.0 / (1.0 + np.exp(np.clip(churn_hazard, -10.0, 10.0)))
     

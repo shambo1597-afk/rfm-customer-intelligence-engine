@@ -108,6 +108,33 @@ def perform_kmeans_clustering(
     return df_ml, kmeans_model, cluster_summary
 
 
+def compute_segment_cluster_crosstab(df_clustered: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Cross-tabulates the rule-based `Segment` taxonomy (src/rfm_engine.py, hand-authored
+    RFM-T quintile thresholds) against the unsupervised `ML_Cluster` assignment (K-Means
+    on log1p + StandardScaler RFM-T features). `df_clustered` must have both columns —
+    i.e. it's the output of perform_kmeans_clustering() run on a Segment-scored frame.
+
+    The two labels are computed completely independently: the rule system has no
+    knowledge of the clustering, and K-Means has no knowledge of the segment rules.
+    This crosstab is a validation/sanity-check tool, not a merge of the two into a new
+    label. Where a Segment's customers land overwhelmingly in one ML_Cluster, that's
+    corroborating evidence the rule-based boundary is capturing a real behavioral
+    grouping. Where a Segment splits roughly evenly across multiple clusters, that
+    segment's quintile thresholds may be cutting across a natural cluster boundary and
+    are worth revisiting.
+
+    Returns (counts, row_pct):
+    - counts: raw crosstab of customer counts, Segment (rows) x ML_Cluster (columns).
+    - row_pct: the same table with each Segment's row normalized to sum to 100%, for
+      comparing segments of very different sizes on the same visual scale.
+    """
+    counts = pd.crosstab(df_clustered["Segment"], df_clustered["ML_Cluster"])
+    row_totals = counts.sum(axis=1).replace(0, 1)
+    row_pct = (counts.div(row_totals, axis=0) * 100.0).round(1)
+    return counts, row_pct
+
+
 def compute_pca_3d(rfmt_df: pd.DataFrame) -> tuple[pd.DataFrame, PCA, np.ndarray]:
     """
     Applies Principal Component Analysis (3 components) on RFM-T features

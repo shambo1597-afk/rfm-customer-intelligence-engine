@@ -11,7 +11,13 @@ import pandas as pd
 import numpy as np
 
 from src.rfm_engine import process_rfmt_pipeline, SEGMENT_PLAYBOOKS, get_segment_kpi_summary
-from src.ml_engine import preprocess_rfmt_features, evaluate_kmeans_candidates, perform_kmeans_clustering, compute_pca_3d
+from src.ml_engine import (
+    preprocess_rfmt_features,
+    evaluate_kmeans_candidates,
+    perform_kmeans_clustering,
+    compute_pca_3d,
+    compute_segment_cluster_crosstab,
+)
 from src.clv_engine import estimate_btyd_clv, get_urgent_churn_watchlist, get_top_future_growth_targets
 from src.cohort_engine import compute_monthly_cohort_matrix
 
@@ -60,6 +66,15 @@ def main():
     df_ml, km_model, cluster_summary = perform_kmeans_clustering(clv_df, n_clusters=optimal_k)
     final_df, pca_model, exp_var = compute_pca_3d(df_ml)
     print(f"    -> 3D PCA Variance Explained: PC1={exp_var[0]}%, PC2={exp_var[1]}%, PC3={exp_var[2]}% (Total={exp_var[:3].sum():.1f}%)")
+
+    # Segment x ML Cluster agreement: a sanity check on the rule-based thresholds, not a
+    # merge of the two label systems (see README "Model Validation" / clustering section).
+    _, seg_cluster_pct = compute_segment_cluster_crosstab(df_ml)
+    print("    -> Segment x ML Cluster agreement (% of each segment's customers per cluster):")
+    for seg in seg_cluster_pct.index:
+        row = seg_cluster_pct.loc[seg]
+        row_str = ", ".join(f"{col}={row[col]:.0f}%" for col in seg_cluster_pct.columns)
+        print(f"         {seg:<18} {row_str}")
 
     # 5. Enrich with Marketing Playbook Guidance
     print("[*] Step 5: Attaching Tactical Marketing Playbooks & Campaign Blueprints...")
