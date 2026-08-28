@@ -128,6 +128,12 @@ def compute_segment_cluster_crosstab(df_clustered: pd.DataFrame) -> tuple[pd.Dat
     - counts: raw crosstab of customer counts, Segment (rows) x ML_Cluster (columns).
     - row_pct: the same table with each Segment's row normalized to sum to 100%, for
       comparing segments of very different sizes on the same visual scale.
+
+    Scope: this is model-validation tooling for the analyst/data-science reviewer of
+    this product, not a customer-facing decision input -- ML_Cluster does not modulate
+    the Segment label, the churn watchlist, or any other downstream output. That's a
+    deliberate boundary for this version, not an unfinished feature; see README
+    "ML Cluster vs. Segment Agreement: What the Clustering Step Is Actually For".
     """
     counts = pd.crosstab(df_clustered["Segment"], df_clustered["ML_Cluster"])
     row_totals = counts.sum(axis=1).replace(0, 1)
