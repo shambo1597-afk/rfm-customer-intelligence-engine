@@ -29,9 +29,10 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
 7. [Repository Structure](#-repository-structure)
 8. [Data Dictionary & Output Deliverables](#-data-dictionary--output-deliverables)
 9. [Installation & Quickstart Guide](#-installation--quickstart-guide)
-10. [Automated Testing Suite](#-automated-testing-suite)
-11. [Model Validation & Backtest Results](#-model-validation--backtest-results)
-12. [Strategic Business Use Cases](#-strategic-business-use-cases)
+10. [Connecting a Shopify Store](#-connecting-a-shopify-store)
+11. [Automated Testing Suite](#-automated-testing-suite)
+12. [Model Validation & Backtest Results](#-model-validation--backtest-results)
+13. [Strategic Business Use Cases](#-strategic-business-use-cases)
 
 ---
 
@@ -374,7 +375,7 @@ rfm-customer-intelligence-engine/
 ├── LICENSE                            # MIT License
 ├── README.md                          # Platform documentation
 ├── requirements.txt                   # Production Python dependencies
-├── requirements-dev.txt               # Dev/test dependencies (pytest, pytest-cov)
+├── requirements-dev.txt               # Dev/test dependencies (pytest, pytest-cov, responses)
 ├── run_app.bat                        # One-click Windows startup batch script
 ├── sample_transactions.csv            # Compatibility transaction dataset
 ├── src/
@@ -382,9 +383,11 @@ rfm-customer-intelligence-engine/
 │   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
 │   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
 │   ├── ml_engine.py                   # Log-transform, StandardScaler, K-Means & 3D PCA decomposition
-│   └── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
+│   ├── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
+│   └── shopify_ingest.py              # Shopify Admin API order ingest (maps to the pipeline schema)
 ├── tests/
-│   └── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
+│   ├── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
+│   └── test_shopify_ingest.py         # Shopify ingest: pagination, rate-limit backoff, schema tests
 ├── test_enterprise_pipeline.py        # Standalone regression script covering all 5 engines
 └── tools/
     └── push_to_github.py              # Maintainer-only publish helper (not part of the platform)
@@ -474,6 +477,37 @@ The dashboard will open automatically in your browser at `http://localhost:8501`
 
 ---
 
+## 🛒 Connecting a Shopify Store
+
+As an alternative to a manual CSV/Excel upload, the sidebar's **"Connect Shopify Store"** data mode pulls orders directly from a connected Shopify store via the [Admin REST API](https://shopify.dev/docs/api/admin-rest) and feeds them into the exact same batch pipeline a CSV upload already goes through.
+
+**This is an ingest-path change only.** The Shopify API call fetches raw order data on demand (a manual "Sync Now" click, not a webhook or a background job) — it does not run any inference per record, and it does not change what happens after the data lands. RFM-T scoring, K-Means/PCA, and the CLV/churn model all continue to run 100% in-process on the resulting DataFrame, with zero external API calls for the scoring step itself — identical to uploading a CSV.
+
+### How it works
+
+1. `fetch_shopify_orders()` (`src/shopify_ingest.py`) calls `GET /admin/api/2024-10/orders.json`, paginating via the cursor-based `page_info` value in the response's `Link` header (Shopify's current pagination mechanism — offset/page-number paging is deprecated on the Admin API).
+2. Each order's line items are exploded into one row per product line — the same granularity as the bundled UCI Online Retail dataset — and mapped into the pipeline's canonical schema: `CustomerID`, `InvoiceNo`, `PurchaseDate`, `TotalSpend`, `Quantity`, `UnitPrice`, `Product`, `ProductCategory`. Cancelled orders and zero-price/zero-quantity line items are excluded.
+3. The resulting DataFrame is passed to `process_rfmt_pipeline()` via the same `custom_mapping` dict shape the CSV/Excel upload flow already builds (`shopify_dataframe_column_mapping()` — an identity mapping, since the columns are already named correctly) — there's no separate ingestion pathway to maintain.
+4. On a 429 (rate limited) response, the client respects Shopify's `Retry-After` header with a sleep/backoff rather than retrying immediately.
+
+### Credentials
+
+Set `SHOPIFY_SHOP_DOMAIN` and `SHOPIFY_ACCESS_TOKEN` via `st.secrets` (Streamlit Cloud's Secrets manager, or a local `.streamlit/secrets.toml`) or as environment variables, and the sidebar's shop domain / access token fields pre-fill from them automatically. You can also type them directly into the sidebar for an ad-hoc session — the access token field is password-masked, and neither value is ever hardcoded, logged, or persisted beyond the current Streamlit session (no database or file is written as a side effect of syncing).
+
+The access token needs the `read_orders` scope. Create one via a [custom app](https://help.shopify.com/en/manual/apps/app-types/custom-apps) in your store's admin (Settings → Apps and sales channels → Develop apps).
+
+### Cost impact
+
+Shopify's Admin REST API has no per-call charge at this data volume for a standard/custom app — calls are governed only by Shopify's leaky-bucket rate limit (handled above), not billed per request. That means this integration lands entirely in the **"Ingest & Pipeline"** cost category as a small, near-zero addition (bounded by `max_pages` per sync click) — it does **not** touch the **"Model / API Inference"** cost category, which remains $0 for the scoring pipeline itself.
+
+### Out of scope for this integration (by design)
+
+- **WooCommerce, Square, or other platforms** — Shopify only, for now.
+- **Webhook-based real-time sync** — polling via a manual "Sync Now" click only, no background job or scheduler.
+- **Persistent storage** — synced data lives only in the current Streamlit session; closing the tab or clicking "Sync Now" again discards/replaces it. No persistence layer was added as a side effect of this feature.
+
+---
+
 ## 🧪 Automated Testing Suite
 
 The repository has two complementary test layers, both run automatically on every push/PR by [GitHub Actions](.github/workflows/test.yml) (see the Build badge at the top of this README for current status):
@@ -491,7 +525,7 @@ python test_enterprise_pipeline.py
 5. `[5/6] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, 100% Month 0 retention identity, and the configurable month cap.
 6. `[6/6] Input Validation & Error Handling`: Confirms unmappable columns, all-rows-filtered datasets, and single-row datasets are all handled correctly (no crash, or a clear `RFMPipelineError`).
 
-**2. `pytest` suite** (`tests/test_pipeline.py`) — function-level unit tests with measured coverage:
+**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`) — function-level unit tests with measured coverage. The Shopify suite mocks every API call via `responses` — no real network calls are made by the test suite:
 
 ```bash
 pip install -r requirements-dev.txt
@@ -506,7 +540,8 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 | `src/cohort_engine.py` | 56 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
 | `src/rfm_engine.py` | 155 | 94% |
-| **Total** | **312** | **97%** |
+| `src/shopify_ingest.py` | 111 | 100% |
+| **Total** | **423** | **98%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 

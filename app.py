@@ -38,6 +38,12 @@ from src.cohort_engine import (
     create_cohort_retention_heatmap,
     create_average_retention_curve
 )
+from src.shopify_ingest import (
+    fetch_shopify_orders,
+    shopify_dataframe_column_mapping,
+    get_shopify_credentials,
+    ShopifyIngestError
+)
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -303,11 +309,63 @@ with st.sidebar:
     
     dataset_source_mode = st.radio(
         "Select Data Mode",
-        options=["Preloaded Datasets", "Upload Custom File"],
+        options=["Preloaded Datasets", "Upload Custom File", "Connect Shopify Store"],
         horizontal=True
     )
 
-    if dataset_source_mode == "Upload Custom File":
+    # Set by the Shopify branch below when synced data already has canonical column
+    # names — skips the manual mapping dropdowns rather than asking the user to
+    # re-map columns we already know.
+    skip_column_mapping_ui = False
+
+    if dataset_source_mode == "Connect Shopify Store":
+        st.caption(
+            "Pulls orders on demand from a connected Shopify store via the Admin API "
+            "and feeds them into the same batch pipeline as an uploaded CSV — an "
+            "ingest-path change only. RFM-T/K-Means/PCA/CLV scoring still runs "
+            "in-process, zero API calls. See README § Connecting a Shopify Store."
+        )
+        default_shop, default_token = get_shopify_credentials()
+        shopify_shop_domain = st.text_input(
+            "Shop Domain",
+            value=default_shop or "",
+            placeholder="your-store.myshopify.com",
+            help="Pre-filled from SHOPIFY_SHOP_DOMAIN in st.secrets/env if configured."
+        )
+        shopify_access_token = st.text_input(
+            "Admin API Access Token",
+            value=default_token or "",
+            type="password",
+            placeholder="shpat_...",
+            help="Pre-filled from SHOPIFY_ACCESS_TOKEN in st.secrets/env if configured. Never logged."
+        )
+        sync_clicked = st.button("🔄 Sync Now", use_container_width=True)
+
+        if sync_clicked:
+            if not shopify_shop_domain or not shopify_access_token:
+                st.error("Enter both a shop domain and an access token before syncing.")
+            else:
+                with st.spinner(f"Pulling orders from {shopify_shop_domain} via the Shopify Admin API..."):
+                    try:
+                        fetched_df = fetch_shopify_orders(shopify_shop_domain, shopify_access_token)
+                        if fetched_df.empty:
+                            st.warning("Sync succeeded but returned zero orders (check the date range / order status on the store).")
+                        else:
+                            st.session_state["shopify_orders_df"] = fetched_df
+                            st.session_state["shopify_shop_label"] = shopify_shop_domain
+                            st.success(f"Synced {len(fetched_df):,} line items from {shopify_shop_domain}.")
+                    except ShopifyIngestError as e:
+                        st.error(f"⚠️ Shopify sync failed: {e}")
+
+        if "shopify_orders_df" in st.session_state:
+            df_raw = st.session_state["shopify_orders_df"]
+            data_source_label = f"Shopify: {st.session_state['shopify_shop_label']}"
+            skip_column_mapping_ui = True
+        else:
+            st.info("Enter your store credentials above and click Sync Now to pull live orders.")
+            df_raw = load_default_transactions("enterprise")
+            data_source_label = "data/ecommerce_transactions.csv (Shopify not yet synced)"
+    elif dataset_source_mode == "Upload Custom File":
         uploaded_file = st.file_uploader(
             "Upload Transactions (CSV / XLSX)",
             type=["csv", "xlsx", "xls"],
@@ -354,62 +412,73 @@ with st.sidebar:
     # ---------------------------------------------------------------------------------------------
     st.markdown("---")
     st.subheader("🧩 Column Mapping")
-    
-    cust_default_idx = detect_default_column(raw_columns, ["customerid", "customer", "customerno", "clientid", "userid", "user", "client", "id"], 0)
-    date_default_idx = detect_default_column(raw_columns, ["purchasedate", "invoicedate", "orderdate", "date", "timestamp", "time", "datetime"], min(1, len(raw_columns)-1))
-    spend_default_idx = detect_default_column(raw_columns, ["totalspend", "total", "spend", "amount", "sales", "revenue", "price", "unitprice"], min(2, len(raw_columns)-1))
 
-    with st.expander("⚙️ Map Dataset Columns", expanded=True):
-        st.caption("Select the columns matching each required engine field:")
-        col_cust = st.selectbox(
-            "Customer ID Column *",
-            options=raw_columns,
-            index=cust_default_idx,
-            help="Unique customer identifier (e.g. CustomerID, User ID, Client ID)."
+    if skip_column_mapping_ui:
+        # fetch_shopify_orders() already emits the pipeline's canonical column names --
+        # reuse the same custom_mapping dict shape the manual dropdowns below build,
+        # rather than asking the user to re-map columns we already know.
+        column_mapping = shopify_dataframe_column_mapping()
+        col_cust, col_date, col_spend = "CustomerID", "PurchaseDate", "TotalSpend"
+        st.caption(
+            "Auto-mapped from the Shopify sync (CustomerID, PurchaseDate, TotalSpend, "
+            "InvoiceNo, ProductCategory) — no manual mapping needed."
         )
-        col_date = st.selectbox(
-            "Transaction Date Column *",
-            options=raw_columns,
-            index=date_default_idx,
-            help="Transaction timestamp or date (e.g. PurchaseDate, OrderDate, InvoiceDate)."
-        )
-        col_spend = st.selectbox(
-            "Total Spend / Amount Column *",
-            options=raw_columns,
-            index=spend_default_idx,
-            help="Monetary transaction value or total sales (e.g. TotalSpend, Amount, Sales)."
-        )
+    else:
+        cust_default_idx = detect_default_column(raw_columns, ["customerid", "customer", "customerno", "clientid", "userid", "user", "client", "id"], 0)
+        date_default_idx = detect_default_column(raw_columns, ["purchasedate", "invoicedate", "orderdate", "date", "timestamp", "time", "datetime"], min(1, len(raw_columns)-1))
+        spend_default_idx = detect_default_column(raw_columns, ["totalspend", "total", "spend", "amount", "sales", "revenue", "price", "unitprice"], min(2, len(raw_columns)-1))
 
-        optional_options = ["(Auto-Detect / None)"] + raw_columns
+        with st.expander("⚙️ Map Dataset Columns", expanded=True):
+            st.caption("Select the columns matching each required engine field:")
+            col_cust = st.selectbox(
+                "Customer ID Column *",
+                options=raw_columns,
+                index=cust_default_idx,
+                help="Unique customer identifier (e.g. CustomerID, User ID, Client ID)."
+            )
+            col_date = st.selectbox(
+                "Transaction Date Column *",
+                options=raw_columns,
+                index=date_default_idx,
+                help="Transaction timestamp or date (e.g. PurchaseDate, OrderDate, InvoiceDate)."
+            )
+            col_spend = st.selectbox(
+                "Total Spend / Amount Column *",
+                options=raw_columns,
+                index=spend_default_idx,
+                help="Monetary transaction value or total sales (e.g. TotalSpend, Amount, Sales)."
+            )
 
-        inv_default = detect_default_column(raw_columns, ["invoiceno", "invoice", "orderno", "orderid", "transactionid"], -1)
-        inv_idx = (inv_default + 1) if inv_default >= 0 else 0
-        col_invoice = st.selectbox(
-            "Invoice / Order ID (Optional)",
-            options=optional_options,
-            index=inv_idx,
-            help="Order or invoice number for frequency deduplication."
-        )
+            optional_options = ["(Auto-Detect / None)"] + raw_columns
 
-        cat_default = detect_default_column(raw_columns, ["productcategory", "category", "itemcategory", "dept", "product"], -1)
-        cat_idx = (cat_default + 1) if cat_default >= 0 else 0
-        col_cat = st.selectbox(
-            "Product / Category (Optional)",
-            options=optional_options,
-            index=cat_idx,
-            help="Product category or item description for category affinity."
-        )
+            inv_default = detect_default_column(raw_columns, ["invoiceno", "invoice", "orderno", "orderid", "transactionid"], -1)
+            inv_idx = (inv_default + 1) if inv_default >= 0 else 0
+            col_invoice = st.selectbox(
+                "Invoice / Order ID (Optional)",
+                options=optional_options,
+                index=inv_idx,
+                help="Order or invoice number for frequency deduplication."
+            )
 
-    # Build active custom column mapping dictionary
-    column_mapping = {
-        "CustomerID": col_cust,
-        "PurchaseDate": col_date,
-        "TotalSpend": col_spend
-    }
-    if col_invoice != "(Auto-Detect / None)":
-        column_mapping["InvoiceNo"] = col_invoice
-    if col_cat != "(Auto-Detect / None)":
-        column_mapping["ProductCategory"] = col_cat
+            cat_default = detect_default_column(raw_columns, ["productcategory", "category", "itemcategory", "dept", "product"], -1)
+            cat_idx = (cat_default + 1) if cat_default >= 0 else 0
+            col_cat = st.selectbox(
+                "Product / Category (Optional)",
+                options=optional_options,
+                index=cat_idx,
+                help="Product category or item description for category affinity."
+            )
+
+        # Build active custom column mapping dictionary
+        column_mapping = {
+            "CustomerID": col_cust,
+            "PurchaseDate": col_date,
+            "TotalSpend": col_spend
+        }
+        if col_invoice != "(Auto-Detect / None)":
+            column_mapping["InvoiceNo"] = col_invoice
+        if col_cat != "(Auto-Detect / None)":
+            column_mapping["ProductCategory"] = col_cat
 
     st.markdown("---")
     st.subheader("⚙️ Reference Timeline")
@@ -631,6 +700,7 @@ with tab2:
             "Rev %": st.column_config.NumberColumn(format="%.1f%%")
         }
     )
+
 
 
 # -------------------------------------------------------------------------------------------------
