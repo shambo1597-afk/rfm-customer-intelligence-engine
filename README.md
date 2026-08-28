@@ -30,9 +30,10 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
 8. [Data Dictionary & Output Deliverables](#-data-dictionary--output-deliverables)
 9. [Installation & Quickstart Guide](#-installation--quickstart-guide)
 10. [Connecting a Shopify Store](#-connecting-a-shopify-store)
-11. [Automated Testing Suite](#-automated-testing-suite)
-12. [Model Validation & Backtest Results](#-model-validation--backtest-results)
-13. [Strategic Business Use Cases](#-strategic-business-use-cases)
+11. [AI Executive Summary (Optional)](#-ai-executive-summary-optional)
+12. [Automated Testing Suite](#-automated-testing-suite)
+13. [Model Validation & Backtest Results](#-model-validation--backtest-results)
+14. [Strategic Business Use Cases](#-strategic-business-use-cases)
 
 ---
 
@@ -382,10 +383,12 @@ rfm-customer-intelligence-engine/
 │   ├── __init__.py                    # Module export definitions
 │   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
 │   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
+│   ├── digest_engine.py               # Optional per-account AI Executive Summary (Anthropic API)
 │   ├── ml_engine.py                   # Log-transform, StandardScaler, K-Means & 3D PCA decomposition
 │   ├── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
 │   └── shopify_ingest.py              # Shopify Admin API order ingest (maps to the pipeline schema)
 ├── tests/
+│   ├── test_digest_engine.py          # AI digest: fallback path, prompt-content, cost-model tests
 │   ├── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
 │   └── test_shopify_ingest.py         # Shopify ingest: pagination, rate-limit backoff, schema tests
 ├── test_enterprise_pipeline.py        # Standalone regression script covering all 5 engines
@@ -498,13 +501,48 @@ The access token needs the `read_orders` scope. Create one via a [custom app](ht
 
 ### Cost impact
 
-Shopify's Admin REST API has no per-call charge at this data volume for a standard/custom app — calls are governed only by Shopify's leaky-bucket rate limit (handled above), not billed per request. That means this integration lands entirely in the **"Ingest & Pipeline"** cost category as a small, near-zero addition (bounded by `max_pages` per sync click) — it does **not** touch the **"Model / API Inference"** cost category, which remains $0 for the scoring pipeline itself.
+Shopify's Admin REST API has no per-call charge at this data volume for a standard/custom app — calls are governed only by Shopify's leaky-bucket rate limit (handled above), not billed per request. That means this integration lands entirely in the **"Ingest & Pipeline"** cost category as a small, near-zero addition (bounded by `max_pages` per sync click) — it does **not** touch the **"Model / API Inference"** cost category, which remains $0 for the scoring pipeline itself (see [AI Executive Summary](#-ai-executive-summary-optional) below for the one feature that does call an LLM, and its own separate cost accounting).
 
 ### Out of scope for this integration (by design)
 
 - **WooCommerce, Square, or other platforms** — Shopify only, for now.
 - **Webhook-based real-time sync** — polling via a manual "Sync Now" click only, no background job or scheduler.
 - **Persistent storage** — synced data lives only in the current Streamlit session; closing the tab or clicking "Sync Now" again discards/replaces it. No persistence layer was added as a side effect of this feature.
+
+---
+
+## 🤖 AI Executive Summary (Optional)
+
+**Model / Intelligence Inference, restated plainly:** RFM-T scoring, K-Means/PCA clustering, and the CLV/churn model (`src/rfm_engine.py`, `src/ml_engine.py`, `src/clv_engine.py`) remain **100% baked-in and zero-API** — unchanged by this feature. The AI Executive Summary described below is the **one optional exception**, off by default, and scoped and cost-accounted exactly as follows.
+
+### What it does
+
+After a batch scoring run, an optional **"AI Digest"** — enabled via a sidebar checkbox, **off by default** — generates **one** natural-language paragraph per account (not per end-customer), summarizing overall customer-base health, the churn-risk situation, and the 90-day revenue outlook. It appears as an expander below the segment breakdown in the "RFM-T Rule Segmentation" tab.
+
+It is a **narrative wrapper on output the pipeline has already computed** — not a new inference step. The prompt (`src/digest_engine.py`) is built from account-level aggregates only:
+
+- Total customers, total historical revenue, total predicted 90-day revenue
+- % of customers at high churn risk
+- The top 3 segments by size
+
+**No raw per-customer rows, IDs, or PII are ever sent to the API** — enforced by construction (the prompt-building function only ever reads from a small aggregate-stats dict, never from the underlying DataFrames directly) and covered by a dedicated test (`tests/test_digest_engine.py`) that asserts no customer ID from the account's data appears in the constructed prompt.
+
+### Cost model — why this is priced at ~$1/month, not ~$208/month
+
+This is the entire reason the feature is scoped the way it is, and it's worth stating explicitly rather than leaving as an implementation detail:
+
+| Design | Calls | Basis | Est. monthly cost @ 8-account pilot |
+|:---|:---|:---|---:|
+| **Rejected: per end-customer** | 1 call *per end-customer*, per batch run | 8 accounts × ~450 customers × 1 batch/day | **~$208/month** |
+| **This design: per account** | 1 call *per account*, per batch run | 8 accounts × 1 batch/day | **~$1/month** |
+
+Both call the same model (Claude Haiku 4.5, `claude-haiku-4-5` — Anthropic's smallest/cheapest current tier, $1.00 / $5.00 per 1M input/output tokens) with the same tiny prompt size; the ~200× cost difference is purely a function of call *volume*, which is a function of *granularity* (per-customer vs. per-account), not model choice or prompt size. A marketer reviewing their dashboard wants one summary of their whole book of business per day — not one paragraph per customer, which nobody reads end-to-end anyway. The full reasoning (with the underlying call-volume arithmetic) is in `src/digest_engine.py`'s module docstring, so it survives in the code a future contributor actually reads, not just in a planning doc.
+
+The digest call is also cached per (account data, API key) via Streamlit's `st.cache_data` — Streamlit reruns the entire script on every UI interaction, so without this cache, moving a slider in an unrelated tab would silently re-trigger a fresh API call and multiply the cost above.
+
+### Credentials & graceful degradation
+
+Set `ANTHROPIC_API_KEY` via `st.secrets` or an environment variable — never hardcoded, never logged. **No key configured is not an error**: `generate_account_digest()` (and every failure path inside it — invalid key, rate limit, network error, empty response) falls back to a deterministic, clearly-labeled template summary built from the same aggregate stats via an f-string, so the feature degrades gracefully and the app never breaks or crashes without a key. Existing users who don't set a key or enable the checkbox see **zero behavior change**.
 
 ---
 
@@ -525,7 +563,7 @@ python test_enterprise_pipeline.py
 5. `[5/6] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, 100% Month 0 retention identity, and the configurable month cap.
 6. `[6/6] Input Validation & Error Handling`: Confirms unmappable columns, all-rows-filtered datasets, and single-row datasets are all handled correctly (no crash, or a clear `RFMPipelineError`).
 
-**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`) — function-level unit tests with measured coverage. The Shopify suite mocks every API call via `responses` — no real network calls are made by the test suite:
+**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`, `tests/test_digest_engine.py`) — function-level unit tests with measured coverage. The Shopify and AI Digest suites mock every external call (via `responses` and `unittest.mock` respectively) — no real network calls are made by the test suite:
 
 ```bash
 pip install -r requirements-dev.txt
@@ -538,10 +576,11 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 |:---|---:|---:|
 | `src/clv_engine.py` | 42 | 100% |
 | `src/cohort_engine.py` | 56 | 100% |
+| `src/digest_engine.py` | 59 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
 | `src/rfm_engine.py` | 155 | 94% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **423** | **98%** |
+| **Total** | **482** | **98%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 

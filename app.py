@@ -44,6 +44,10 @@ from src.shopify_ingest import (
     get_shopify_credentials,
     ShopifyIngestError
 )
+from src.digest_engine import (
+    generate_account_digest,
+    get_anthropic_api_key
+)
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -256,6 +260,17 @@ def cached_perform_kmeans_clustering(clv_df: pd.DataFrame, n_clusters: int = 4):
 @st.cache_data(show_spinner="Building Monthly Cohort Retention Matrix...")
 def cached_compute_monthly_cohort_matrix(clean_tx: pd.DataFrame):
     return compute_monthly_cohort_matrix(clean_tx)
+
+
+@st.cache_data(show_spinner="Generating AI executive summary...")
+def cached_generate_account_digest(rfmt_df: pd.DataFrame, clv_df: pd.DataFrame,
+                                    segment_summary: pd.DataFrame, api_key: str = None):
+    # Cached (keyed on the data + api_key) so this only calls the Anthropic API once
+    # per account per batch run -- Streamlit reruns the whole script on every widget
+    # interaction elsewhere in the app, and without this cache each of those reruns
+    # would fire a fresh API call, silently multiplying the "one call per account per
+    # batch run" cost model this feature was built around (see src/digest_engine.py).
+    return generate_account_digest(rfmt_df, clv_df, segment_summary, api_key=api_key)
 
 
 def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
@@ -498,7 +513,23 @@ with st.sidebar:
         snapshot_date = default_snapshot
 
     st.markdown("---")
-    st.caption("AI-Powered Customer Intelligence • Zero External Cost")
+    st.subheader("🤖 AI Executive Summary")
+    enable_ai_digest = st.checkbox(
+        "Enable AI Digest — uses Anthropic API",
+        value=False,
+        help=(
+            "Off by default. Generates ONE narrative paragraph per account per view "
+            "from already-computed aggregate stats (never raw customer rows) — see "
+            "README § AI Executive Summary (Optional) for the cost model "
+            "(~$1/month at pilot volume vs. ~$208/month for a per-customer design)."
+        )
+    )
+    anthropic_api_key = get_anthropic_api_key() if enable_ai_digest else None
+    if enable_ai_digest and not anthropic_api_key:
+        st.caption("⚠️ No ANTHROPIC_API_KEY found in st.secrets/env — will show a template summary instead.")
+
+    st.markdown("---")
+    st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
 
 
 # -------------------------------------------------------------------------------------------------
@@ -701,6 +732,21 @@ with tab2:
         }
     )
 
+    st.markdown("---")
+    with st.expander("🤖 AI Executive Summary", expanded=enable_ai_digest):
+        st.caption(
+            "One narrative paragraph built from the aggregate stats above (segment "
+            "sizes, % at-risk, 90-day forecast) — never raw per-customer rows. "
+            "Off by default; enable via the sidebar. See README § AI Executive "
+            "Summary (Optional) for the cost model."
+        )
+        if enable_ai_digest:
+            digest_text = cached_generate_account_digest(rfmt_df, clv_df, segment_summary, api_key=anthropic_api_key)
+            st.markdown(digest_text)
+            if not anthropic_api_key:
+                st.caption("ℹ️ Showing the template summary — configure ANTHROPIC_API_KEY for the AI-generated version.")
+        else:
+            st.info("Enable \"AI Digest\" in the sidebar to generate this summary.")
 
 
 # -------------------------------------------------------------------------------------------------
