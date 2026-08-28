@@ -171,6 +171,8 @@ Instead, `compute_segment_cluster_crosstab()` (`src/ml_engine.py`) cross-tabulat
 
 On the bundled synthetic dataset ($k=3$, via `python generate_action_plan.py`), most segments agree strongly with one cluster (Champions, Can't Lose Them: 100%; At-Risk VIPs: 99%; New Customers: 100% — each landing almost entirely in a single cluster) — but **Potential Growth splits 38% / 62%** across two clusters, and **Hibernating splits 22% / 76% / 2%** across all three. That's the crosstab doing its job: it's telling you those two segments' quintile cutoffs cut across boundaries K-Means finds naturally, which is exactly the kind of thing worth investigating before trusting those segments' marketing playbooks at face value. Re-run `python generate_action_plan.py` for the current numbers on your data — they will differ from a synthetic-data snapshot.
 
+**Scope, stated explicitly rather than left ambiguous:** this crosstab is a model-validation tool for the analyst or data-science reviewer of this product — it answers "does the unsupervised clustering corroborate the hand-picked segment thresholds, or suggest one needs revisiting?" It is **not** a customer-facing decision input: `ML_Cluster` does not currently modulate the `Segment` label, the Urgent Churn Watchlist's ranking, or any other customer-facing output anywhere in this platform. That is a deliberate scope boundary for this version, not an unfinished feature — actually using the crosstab's signal to re-threshold a segment or re-prioritize the watchlist is a separate, larger decision, left for a future version.
+
 ---
 
 ### 4. Dimensionality Reduction: 3D Principal Component Analysis (PCA)
@@ -578,9 +580,9 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 | `src/cohort_engine.py` | 56 | 100% |
 | `src/digest_engine.py` | 59 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
-| `src/rfm_engine.py` | 155 | 94% |
+| `src/rfm_engine.py` | 155 | 100% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **482** | **98%** |
+| **Total** | **482** | **99%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 
