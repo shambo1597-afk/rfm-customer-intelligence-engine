@@ -578,9 +578,9 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 | `src/cohort_engine.py` | 56 | 100% |
 | `src/digest_engine.py` | 59 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
-| `src/rfm_engine.py` | 155 | 94% |
+| `src/rfm_engine.py` | 155 | 100% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **482** | **98%** |
+| **Total** | **482** | **99%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 

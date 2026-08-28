@@ -127,6 +127,123 @@ class TestStandardizeTransactions:
         assert len(clean) == 1
         assert clean.iloc[0]["CustomerID"] == "A"
 
+    def test_auto_detection_fires_with_no_custom_mapping_for_all_six_target_fields(self):
+        # No custom_mapping at all, and every header is a guessable alias rather than
+        # the canonical name -- this is the path that was previously untested:
+        # test_auto_detects_standard_column_names (above) uses a fixture that already
+        # has canonical column names, so the "not in df_clean.columns" guards are
+        # already False and the auto-detect loop bodies never run; and
+        # test_custom_mapping_overrides_auto_detection short-circuits the same loop
+        # by pre-setting the target columns via custom_mapping. This is the case
+        # where the loop actually has to do the alias-matching work itself.
+        df = pd.DataFrame({
+            "customer_id": ["A", "A", "B"],
+            "order_date": ["2026-01-01", "2026-02-01", "2026-01-15"],
+            "amount": [10.0, 20.0, 30.0],
+            "order_no": ["INV-1", "INV-2", "INV-3"],
+            "dept": ["Electronics", "Electronics", "Home"],
+            "item": ["Widget", "Widget", "Gadget"],
+        })
+        clean = standardize_transactions(df)
+        assert set(clean["CustomerID"]) == {"A", "B"}
+        assert clean["PurchaseDate"].notna().all()
+        assert clean["TotalSpend"].sum() == 60.0
+        assert set(clean["InvoiceNo"]) == {"INV-1", "INV-2", "INV-3"}
+        assert set(clean["ProductCategory"]) == {"Electronics", "Home"}
+        assert set(clean["Product"]) == {"Widget", "Gadget"}
+
+    @pytest.mark.parametrize("field,alias_col,values,expected", [
+        ("CustomerID", "clientid", ["A", "B"], ["A", "B"]),
+        ("CustomerID", "userid", ["A", "B"], ["A", "B"]),
+        ("PurchaseDate", "invoicedate", ["2026-01-01", "2026-02-01"], None),
+        ("PurchaseDate", "timestamp", ["2026-01-01", "2026-02-01"], None),
+        ("TotalSpend", "spend", [12.0, 34.0], [12.0, 34.0]),
+        ("TotalSpend", "revenue", [12.0, 34.0], [12.0, 34.0]),
+        ("InvoiceNo", "orderid", ["INV-A", "INV-B"], ["INV-A", "INV-B"]),
+        ("InvoiceNo", "transactionid", ["INV-A", "INV-B"], ["INV-A", "INV-B"]),
+        ("ProductCategory", "category", ["Cat1", "Cat2"], ["Cat1", "Cat2"]),
+        ("ProductCategory", "itemcategory", ["Cat1", "Cat2"], ["Cat1", "Cat2"]),
+    ])
+    def test_additional_alias_names_are_recognized(self, field, alias_col, values, expected):
+        # A second (and third) alias per field, distinct from the ones exercised
+        # above -- this is what actually catches a typo in the alias list itself
+        # (e.g. a field that only recognizes the first-listed alias), rather than
+        # just proving the auto-detection mechanism fires once. For fields with a
+        # fallback default (InvoiceNo, ProductCategory), a plain "column exists"
+        # check would pass vacuously even if the alias were never matched -- so
+        # every case here asserts the actual alias values landed, not just presence.
+        base = {
+            "CustomerID": ["X", "Y"],
+            "PurchaseDate": ["2026-01-01", "2026-01-02"],
+            "TotalSpend": [10.0, 20.0],
+        }
+        base.pop(field, None)
+        df = pd.DataFrame({**base, alias_col: values})
+        clean = standardize_transactions(df)
+        assert field in clean.columns
+        if expected is not None:
+            assert list(clean[field]) == expected
+        else:
+            assert clean[field].notna().all()
+            assert clean[field].nunique() == 2
+
+    def test_unrecognized_column_alias_is_left_alone(self):
+        df = pd.DataFrame({
+            "CustomerID": ["A", "B"],
+            "PurchaseDate": ["2026-01-01", "2026-01-02"],
+            "TotalSpend": [10.0, 20.0],
+            "shipping_zone": ["West", "East"],
+        })
+        clean = standardize_transactions(df)
+        # An unrecognized column must survive untouched under its own name -- it
+        # must not get miscategorized into any target field, and must not crash.
+        assert "shipping_zone" in clean.columns
+        assert list(clean["shipping_zone"]) == ["West", "East"]
+        # The fields nothing else matched still get their documented defaults.
+        assert set(clean["ProductCategory"]) == {"General Merchandise"}
+
+    def test_custom_mapping_wins_over_a_conflicting_auto_detectable_column(self):
+        # "customerid" would auto-detect to CustomerID on its own -- but custom_mapping
+        # explicitly routes CustomerID from "client_id" instead, and the two columns
+        # deliberately disagree, so a passing assertion proves custom_mapping is
+        # authoritative rather than winning by coincidence. PurchaseDate/TotalSpend
+        # are left unmapped, exercising auto-detection for those two in the same call.
+        df = pd.DataFrame({
+            "client_id": ["A", "A", "B"],
+            "customerid": ["WRONG-A", "WRONG-A", "WRONG-B"],
+            "order_date": ["2026-01-01", "2026-02-01", "2026-01-15"],
+            "amount": [10.0, 20.0, 30.0],
+        })
+        clean = standardize_transactions(df, custom_mapping={"CustomerID": "client_id"})
+        assert set(clean["CustomerID"]) == {"A", "B"}
+        assert "WRONG-A" not in set(clean["CustomerID"])
+        assert clean["TotalSpend"].sum() == 60.0
+        assert clean["PurchaseDate"].notna().all()
+
+    def test_custom_mapping_covers_optional_invoice_and_category_fields(self):
+        # test_custom_mapping_overrides_auto_detection only maps the 3 required
+        # fields; this covers the optional InvoiceNo/ProductCategory custom_mapping
+        # branches specifically.
+        df = pd.DataFrame({
+            "cust": ["A", "A", "B"],
+            "dt": ["2026-01-01", "2026-01-02", "2026-01-03"],
+            "amt": [10.0, 20.0, 30.0],
+            "order_ref": ["ORD-1", "ORD-2", "ORD-3"],
+            "product_dept": ["Books", "Books", "Toys"],
+        })
+        clean = standardize_transactions(
+            df,
+            custom_mapping={
+                "CustomerID": "cust",
+                "PurchaseDate": "dt",
+                "TotalSpend": "amt",
+                "InvoiceNo": "order_ref",
+                "ProductCategory": "product_dept",
+            },
+        )
+        assert set(clean["InvoiceNo"]) == {"ORD-1", "ORD-2", "ORD-3"}
+        assert set(clean["ProductCategory"]) == {"Books", "Toys"}
+
 
 class TestComputeRfmtAndScores:
     def test_rfmt_has_one_row_per_customer(self, clean_tx_df, rfmt_df):
@@ -152,6 +269,52 @@ class TestComputeRfmtAndScores:
         scored = calculate_rfmt_scores(tiny)
         assert (scored["R_Score"] == 5).all()
         assert (scored["F_Score"] == 5).all()
+
+
+class TestSnapshotDateHandling:
+    """
+    Every other test in this file calls compute_rfmt()/process_rfmt_pipeline() with
+    snapshot_date=None (the default), which only exercises the `if snapshot_date is
+    None` branch. These tests specifically cover the `else` branch (an explicit
+    snapshot_date, run through pd.to_datetime()) and pin down exactly what the
+    None-default resolves to, rather than leaving it implicit.
+    """
+
+    def test_explicit_snapshot_date_is_used_verbatim(self, clean_tx_df):
+        explicit_snapshot = pd.Timestamp("2030-01-01")
+        rfmt = compute_rfmt(clean_tx_df, snapshot_date=explicit_snapshot)
+
+        most_recent_customer_id = clean_tx_df.loc[clean_tx_df["PurchaseDate"].idxmax(), "CustomerID"]
+        max_purchase = clean_tx_df["PurchaseDate"].max()
+        expected_recency = (explicit_snapshot - max_purchase).days
+
+        actual_recency = rfmt.loc[rfmt["CustomerID"] == most_recent_customer_id, "Recency"].iloc[0]
+        assert actual_recency == expected_recency
+
+    def test_explicit_snapshot_date_accepts_a_plain_string(self, clean_tx_df):
+        # Covers the pd.to_datetime(snapshot_date) conversion specifically -- a plain
+        # string (not already a Timestamp) must be coerced the same way.
+        rfmt_from_string = compute_rfmt(clean_tx_df, snapshot_date="2030-06-15")
+        rfmt_from_timestamp = compute_rfmt(clean_tx_df, snapshot_date=pd.Timestamp("2030-06-15"))
+        pd.testing.assert_series_equal(
+            rfmt_from_string.sort_values("CustomerID")["Recency"].reset_index(drop=True),
+            rfmt_from_timestamp.sort_values("CustomerID")["Recency"].reset_index(drop=True),
+        )
+
+    def test_none_snapshot_date_defaults_to_max_purchase_date_plus_one_day(self, clean_tx_df):
+        rfmt_default = compute_rfmt(clean_tx_df, snapshot_date=None)
+
+        most_recent_customer_id = clean_tx_df.loc[clean_tx_df["PurchaseDate"].idxmax(), "CustomerID"]
+        actual_recency = rfmt_default.loc[rfmt_default["CustomerID"] == most_recent_customer_id, "Recency"].iloc[0]
+
+        # The customer whose last purchase IS the dataset's global max must show
+        # Recency == 1 day, because the implied snapshot is (max PurchaseDate + 1 day)
+        # -- not datetime.now(), which for this dataset's dates would give a much
+        # larger, unrelated number.
+        assert actual_recency == 1
+
+        hypothetical_now_recency = (pd.Timestamp.now() - clean_tx_df["PurchaseDate"].max()).days
+        assert actual_recency != hypothetical_now_recency
 
 
 class TestSegmentAssignment:
