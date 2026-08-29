@@ -71,6 +71,17 @@ require billing to be configured and are not on the free tier.
   account counts, not a bug -- it is caught below and routed to the same
   fallback template as every other failure mode, never raised.
 
+  Error handling note: `client.interactions.create()` (the Interactions API this
+  module calls) raises `google.genai._gaos.lib.compat_errors.APIStatusError` /
+  `APIError` -- a private-submodule hierarchy, and NOT `google.genai.errors.
+  ClientError`/`ServerError`, which is only raised by the older `client.models.
+  generate_content()` call path this module deliberately does not use. This was
+  confirmed by reproducing a real invalid-key call against the pinned SDK
+  version, not assumed from documentation -- see requirements.txt's version
+  bound. That reproduction also showed Google's real invalid-key response is
+  `400 BadRequestError` with `'API_KEY_INVALID'` in the body, not 401/403 as
+  HTTP convention might suggest -- both are checked below.
+
 Anthropic (fallback, MODEL_ID below): Claude Haiku 4.5, $1.00 / $5.00 per 1M
 input/output tokens -- the "small/cheap model" tier, not free, but Anthropic's
 standard paid-API terms do not use submitted content to train models.
@@ -93,8 +104,22 @@ except ImportError:  # pragma: no cover - exercised by the "package not installe
 
 try:
     from google import genai
-    from google.genai import errors as genai_errors
-except ImportError:  # pragma: no cover - exercised by the "package not installed" fallback path.
+    # NOTE: deliberately NOT `google.genai.errors` (ClientError/ServerError). That
+    # public module is the exception hierarchy for the OLDER `client.models.
+    # generate_content()` call path -- it is never raised by `client.interactions.
+    # create()`, the API this module actually calls. Confirmed by reproducing a
+    # real invalid-key call against the pinned google-genai version (see
+    # requirements.txt): the exception that comes back is
+    # `google.genai._gaos.lib.compat_errors.BadRequestError`, an entirely
+    # different, unrelated class hierarchy. `_gaos` is a private/internal
+    # submodule (leading underscore) with no public alias for these classes as of
+    # this SDK version -- there is currently no other way to name them. This is
+    # exactly the kind of import that can silently break on an SDK upgrade, which
+    # is why requirements.txt pins google-genai to a bounded range rather than an
+    # open floor, and why every except clause below falls through to a safe
+    # generic fallback (never a crash) if this shape changes again.
+    from google.genai._gaos.lib import compat_errors as genai_errors
+except ImportError:  # pragma: no cover - exercised by the "package not installed"/API-shape-changed fallback path.
     genai = None
     genai_errors = None
 
@@ -336,19 +361,39 @@ def generate_account_digest(
             )
             text = (interaction.output_text or "").strip()
             return text if text else _fallback_digest(stats, reason="empty response from Gemini")
-        except genai_errors.ClientError as e:
-            code = getattr(e, "code", None)
-            status = (getattr(e, "status", "") or "").upper()
-            if code == 429 or status == "RESOURCE_EXHAUSTED":
+        except genai_errors.APIStatusError as e:
+            # `.status_code` is a real, documented int attribute on this SDK's
+            # APIStatusError (confirmed by direct reproduction against the pinned
+            # google-genai version, not assumed -- see requirements.txt). Note
+            # Google's actual behavior here is NOT what HTTP-status convention
+            # would suggest: an invalid API key comes back as `400 BadRequestError`
+            # with `'reason': 'API_KEY_INVALID'` in the body, not 401/403 --
+            # confirmed the same way. Both are checked so a real invalid-key error
+            # is still recognized however a given deployment's Google Cloud
+            # project happens to report it.
+            status_code = getattr(e, "status_code", None)
+            message = str(e)
+            if status_code == 429 or "RESOURCE_EXHAUSTED" in message:
                 # Expected at higher account counts on the free tier -- not a bug.
                 return _fallback_digest(stats, reason="Gemini free-tier rate limit reached")
-            if code in (401, 403):
+            if status_code in (401, 403) or "API_KEY_INVALID" in message:
                 return _fallback_digest(stats, reason="invalid Gemini API key")
             return _fallback_digest(stats, reason="Gemini API error")
-        except genai_errors.ServerError:
-            return _fallback_digest(stats, reason="Gemini API server error")
+        except genai_errors.APIError:
+            # Broad base class for everything else the SDK raises for this call
+            # (connection/timeout errors, and any future APIStatusError subclass
+            # not distinguished above) -- still a diagnosable "the SDK reported an
+            # API error", not a truly unanticipated exception. Catching the base
+            # class here (rather than only the specific subclasses above) means a
+            # future error variant this code doesn't yet know about still gets a
+            # meaningful reason instead of silently falling through to the
+            # generic catch-all below, which is exactly the bug being fixed.
+            return _fallback_digest(stats, reason="Gemini API error")
         except Exception:
-            # Last-resort safety net -- this optional feature must never crash the app.
+            # Last-resort safety net -- this optional feature must never crash the
+            # app -- but by this point every error shape the SDK is documented (and
+            # confirmed) to raise for this call has already been handled above, so
+            # reaching here means something genuinely unanticipated happened.
             return _fallback_digest(stats, reason="unexpected error generating the AI summary via Gemini")
 
     # provider == "anthropic" -- unchanged from the original Anthropic-only implementation.
