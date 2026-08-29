@@ -8,6 +8,12 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 
+# A month-since-acquisition column needs at least this many cohorts with
+# non-NaN data before find_notable_cohort_pattern() (below) will compute a
+# z-score for it at all -- see that function's docstring for why 3, not 2.
+NOTABLE_COHORT_MIN_COLUMN_SAMPLES = 3
+
+
 def compute_monthly_cohort_matrix(
     df_transactions: pd.DataFrame,
     max_months: int = 13
@@ -72,6 +78,100 @@ def compute_monthly_cohort_matrix(
         count_matrix = count_matrix.iloc[:, :max_months]
         
     return count_matrix, retention_matrix, cohort_sizes
+
+
+def find_notable_cohort_pattern(retention_matrix: pd.DataFrame) -> dict:
+    """
+    Deterministic (no LLM, plain pandas/numpy) scan of retention_matrix --
+    the SAME matrix compute_monthly_cohort_matrix() returns and app.py Tab 1
+    already renders as a heatmap -- for the single cell that deviates most
+    from its peers, so an optional LLM narration (src/cohort_narration.py)
+    has one concrete, already-computed finding to explain rather than a
+    whole matrix to guess at.
+
+    "Peers" means every OTHER cohort at the SAME months-since-acquisition
+    column (comparing a cohort's Month 3 retention against other cohorts'
+    Month 3 retention, never against a different column -- cohorts at
+    different tenures aren't directly comparable). Month 0 is excluded
+    entirely: every cohort is 100% retained at Month 0 by construction (see
+    compute_monthly_cohort_matrix()), so that column carries no signal.
+
+    Definition of "notable" (documented here, not left implicit, so this is
+    independently testable against a known answer): for each remaining
+    month-since-acquisition column, compute that column's mean and
+    population standard deviation (ddof=0 -- this describes the column of
+    cohorts actually observed, not an estimate for some larger unobserved
+    population) across every cohort that has reached that month (non-NaN
+    cells only -- a cohort acquired too recently to have reached month k is
+    correctly absent, not treated as a zero). A column is skipped outright
+    if fewer than NOTABLE_COHORT_MIN_COLUMN_SAMPLES cohorts have data there,
+    or its standard deviation is 0 (either every cohort matches exactly, or
+    there's too little spread to call anything "unusual" relative to it).
+    NOTABLE_COHORT_MIN_COLUMN_SAMPLES is 3, not 2: with only two cohorts,
+    both are always exactly +-1 standard deviation from their shared mean by
+    construction, which is a relative ranking between two points, not a
+    genuine "one stands out from several peers" finding.
+
+    For every remaining cell, z_score = (cell_value - column_mean) /
+    column_std -- computed against the WHOLE column's own mean/std
+    (including the cell itself), not a leave-one-out mean excluding it. This
+    is a deliberate simplification: with 3+ cohorts per column (the minimum
+    enforced above), one outlier's pull on the column mean is small enough
+    to rarely change WHICH cell has the largest |z_score|, and the purpose
+    here is to deterministically pick "the" most unusual cell, not to
+    produce a bias-corrected outlier statistic.
+
+    The single cell with the largest |z_score| across the whole matrix wins.
+    Ties are broken by the first such cell encountered in column-then-row
+    order (retention_matrix.columns is already ascending month order, and
+    each column's cohorts are iterated in the column's own existing order)
+    -- deterministic, not an arbitrary dict-ordering accident.
+
+    Returns {} if no column has enough data to compute a z-score at all
+    (e.g. a brand-new dataset with too few cohorts, or every cohort still on
+    Month 0) -- callers must treat an empty dict as "nothing notable to
+    report yet," not an error.
+
+    Otherwise returns a dict with: cohort (str), month_index (int),
+    retention_pct (this cell's actual value), column_mean_pct,
+    column_std_pct, deviation_pct_points (cell - column mean, signed),
+    z_score (signed), and direction ("unusually high" if z_score > 0 else
+    "unusually low").
+    """
+    if retention_matrix is None or retention_matrix.empty:
+        return {}
+
+    best = None  # (abs_z, cohort, month_index, value, mean, std, z)
+    for month_index in retention_matrix.columns:
+        if month_index == 0:
+            continue
+        column = retention_matrix[month_index].dropna()
+        if len(column) < NOTABLE_COHORT_MIN_COLUMN_SAMPLES:
+            continue
+        mean = float(column.mean())
+        std = float(column.std(ddof=0))
+        if std == 0:
+            continue
+        for cohort, value in column.items():
+            z = (float(value) - mean) / std
+            abs_z = abs(z)
+            if best is None or abs_z > best[0]:
+                best = (abs_z, str(cohort), int(month_index), float(value), mean, std, z)
+
+    if best is None:
+        return {}
+
+    _, cohort, month_index, value, mean, std, z = best
+    return {
+        "cohort": cohort,
+        "month_index": month_index,
+        "retention_pct": round(value, 1),
+        "column_mean_pct": round(mean, 1),
+        "column_std_pct": round(std, 2),
+        "deviation_pct_points": round(value - mean, 1),
+        "z_score": round(z, 2),
+        "direction": "unusually high" if z > 0 else "unusually low",
+    }
 
 
 def create_cohort_retention_heatmap(retention_matrix: pd.DataFrame, count_matrix: pd.DataFrame) -> go.Figure:

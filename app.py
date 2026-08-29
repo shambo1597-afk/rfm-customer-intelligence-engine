@@ -36,7 +36,8 @@ from src.clv_engine import (
 from src.cohort_engine import (
     compute_monthly_cohort_matrix,
     create_cohort_retention_heatmap,
-    create_average_retention_curve
+    create_average_retention_curve,
+    find_notable_cohort_pattern
 )
 from src.shopify_ingest import (
     fetch_shopify_orders,
@@ -52,6 +53,14 @@ from src.digest_engine import (
 )
 from src.chat_context import build_account_context_blob, build_context_text
 from src.chat_engine import answer_account_question, escape_markdown_dollar_signs
+from src.roi_advisor import (
+    simulate_campaign_roi,
+    simulate_all_segment_allocations,
+    get_roi_recommendation,
+    DEFAULT_CONV_RATE_PCT,
+    DEFAULT_GROSS_MARGIN_PCT,
+)
+from src.cohort_narration import narrate_cohort_pattern
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -299,6 +308,43 @@ def cached_build_account_context_blob(rfmt_df: pd.DataFrame, clv_df: pd.DataFram
     # per-question LLM call itself -- chat's cost model is usage-based, unlike
     # the digest's fixed-per-batch-run one).
     return build_account_context_blob(rfmt_df, clv_df, segment_summary, cohort_matrix, crosstab_counts)
+
+
+@st.cache_data(show_spinner="Analyzing budget allocation across segments...")
+def cached_get_roi_recommendation(question: str, allocations_df: pd.DataFrame, total_budget: float,
+                                   anthropic_api_key: str = None,
+                                   groq_api_key: str = None,
+                                   provider_override: str = None):
+    # Cached (keyed on the question + allocations table + budget + keys) for
+    # the same reason cached_generate_account_digest() above is cached --
+    # Streamlit reruns the whole script on every widget interaction
+    # elsewhere in the app, and without this cache each of those reruns
+    # would fire a fresh API call for the same question against the same
+    # table.
+    return get_roi_recommendation(
+        question, allocations_df, total_budget,
+        anthropic_api_key=anthropic_api_key,
+        groq_api_key=groq_api_key,
+        provider_override=provider_override
+    )
+
+
+@st.cache_data(show_spinner="Narrating cohort pattern...")
+def cached_narrate_cohort_pattern(pattern: dict,
+                                   anthropic_api_key: str = None,
+                                   groq_api_key: str = None,
+                                   provider_override: str = None):
+    # Cached for the same reason as the two functions above -- there is at
+    # most ONE notable pattern per batch run (find_notable_cohort_pattern()
+    # returns a single dict, not a list), so without this cache an unrelated
+    # widget interaction elsewhere in the app would still silently
+    # re-trigger a fresh API call for the same finding.
+    return narrate_cohort_pattern(
+        pattern,
+        anthropic_api_key=anthropic_api_key,
+        groq_api_key=groq_api_key,
+        provider_override=provider_override
+    )
 
 
 def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
@@ -572,12 +618,39 @@ with st.sidebar:
             "asked), unlike the AI Digest's fixed one-call-per-batch-run cost."
         )
     )
-    resolve_llm_keys = enable_ai_digest or enable_chat_qa
+    enable_roi_advisor = st.checkbox(
+        "Enable AI Budget Advisor — uses the same API key as AI Digest",
+        value=False,
+        help=(
+            "Off by default. In the 💰 What-If ROI Simulator tab, runs the SAME "
+            "deterministic ROI formulas already used there across EVERY segment "
+            "(not just the one segment the sliders point at), splitting your "
+            "campaign budget proportionally across segments, then has the LLM "
+            "explain the comparison and recommend an allocation — using ONLY "
+            "the numbers in the comparison table shown alongside it, never "
+            "invented or recomputed figures. See README § AI Budget Advisor "
+            "(Optional)."
+        )
+    )
+    enable_cohort_narration = st.checkbox(
+        "Enable Cohort Pattern Narration — uses the same API key as AI Digest",
+        value=False,
+        help=(
+            "Off by default. In the 📊 Executive KPI & Cohort Matrix tab, "
+            "deterministically identifies the single most statistically "
+            "unusual cohort-month cell in the retention matrix already shown "
+            "there (a plain z-score computation — real information on its own, "
+            "with zero API cost), then has the LLM explain it in one or two "
+            "plain-language sentences. See README § Cohort Pattern Narration "
+            "(Optional)."
+        )
+    )
+    resolve_llm_keys = enable_ai_digest or enable_chat_qa or enable_roi_advisor or enable_cohort_narration
     anthropic_api_key = get_anthropic_api_key() if resolve_llm_keys else None
     groq_api_key = get_groq_api_key() if resolve_llm_keys else None
     digest_provider_override = get_digest_provider_override() if resolve_llm_keys else None
     if resolve_llm_keys and not anthropic_api_key and not groq_api_key:
-        st.caption("⚠️ No GROQ_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A will be unavailable.")
+        st.caption("⚠️ No GROQ_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A / AI Budget Advisor / Cohort Pattern Narration will be unavailable.")
 
     st.markdown("---")
     st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
@@ -742,7 +815,50 @@ with tab1:
                     """,
                     unsafe_allow_html=True
                 )
-                
+
+                # 🔍 Notable Pattern -- gated behind its own off-by-default
+                # sidebar checkbox, same pattern as AI Digest/Chat Q&A above.
+                # find_notable_cohort_pattern() (src/cohort_engine.py) is a
+                # plain, deterministic z-score computation -- zero API cost,
+                # real information on its own -- so it's always shown in full
+                # once this section is enabled, regardless of whether an LLM
+                # key happens to be configured; the LLM narration below it is
+                # additive polish, never the only source of the finding (see
+                # src/cohort_narration.py's module docstring).
+                if enable_cohort_narration:
+                    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                    notable_pattern = find_notable_cohort_pattern(retention_matrix)
+                    if notable_pattern:
+                        st.markdown(
+                            f"""
+                            <div class="kpi-container">
+                                <div class="kpi-label">🔍 Notable Pattern</div>
+                                <div style="font-size: 0.90rem; line-height: 1.6; color: #E2E8F0;">
+                                    <strong>{notable_pattern['cohort']}</strong> cohort's
+                                    <strong>Month {notable_pattern['month_index']}</strong> retention is
+                                    <strong>{notable_pattern['retention_pct']:.1f}%</strong>
+                                    ({notable_pattern['deviation_pct_points']:+.1f} pts vs. the
+                                    {notable_pattern['column_mean_pct']:.1f}% average for other cohorts at
+                                    that same month — {notable_pattern['direction']}, z-score
+                                    {notable_pattern['z_score']:+.2f}).
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        if anthropic_api_key or groq_api_key:
+                            narration = cached_narrate_cohort_pattern(
+                                notable_pattern,
+                                anthropic_api_key=anthropic_api_key,
+                                groq_api_key=groq_api_key,
+                                provider_override=digest_provider_override,
+                            )
+                            st.markdown(escape_markdown_dollar_signs(narration))
+                        else:
+                            st.caption("ℹ️ Configure GROQ_API_KEY (free) or ANTHROPIC_API_KEY for a plain-language explanation of this finding.")
+                    else:
+                        st.caption("No statistically notable cohort pattern found yet (too few cohorts with overlapping history).")
+
         except Exception as err:
             st.warning(f"Unable to render cohort matrix: {err}")
 
@@ -1163,17 +1279,26 @@ with tab5:
         audience_size = int(max_reach * (target_audience_pct / 100.0))
         
         campaign_budget = st.number_input("3. Total Campaign Budget ($)", min_value=500, max_value=50000, value=3500, step=500)
-        expected_conv_rate = st.slider("4. Expected Campaign Conversion Rate (%)", min_value=1.0, max_value=30.0, value=8.5, step=0.5)
-        gross_margin_pct = st.slider("5. Product Gross Margin (%)", min_value=15, max_value=85, value=40, step=5)
+        expected_conv_rate = st.slider("4. Expected Campaign Conversion Rate (%)", min_value=1.0, max_value=30.0, value=DEFAULT_CONV_RATE_PCT, step=0.5)
+        gross_margin_pct = st.slider("5. Product Gross Margin (%)", min_value=15, max_value=85, value=DEFAULT_GROSS_MARGIN_PCT, step=5)
 
-    # Calculate Simulation Financials
+    # Calculate Simulation Financials -- simulate_campaign_roi() (src/roi_advisor.py)
+    # is the single source of truth for this math; the AI Budget Advisor below
+    # reuses the exact same function per segment, not a second copy of these formulas.
     avg_segment_aov = seg_cust_df["AvgOrderValue"].mean() if len(seg_cust_df) > 0 else 150.0
-    projected_conversions = audience_size * (expected_conv_rate / 100.0)
-    projected_gross_revenue = projected_conversions * avg_segment_aov
-    projected_gross_profit = projected_gross_revenue * (gross_margin_pct / 100.0)
-    net_incremental_profit = projected_gross_profit - campaign_budget
-    campaign_roi_pct = (net_incremental_profit / max(campaign_budget, 1)) * 100.0
-    cost_per_acquisition = campaign_budget / max(projected_conversions, 1)
+    sim_result = simulate_campaign_roi(
+        audience_size=audience_size,
+        avg_segment_aov=avg_segment_aov,
+        campaign_budget=campaign_budget,
+        conv_rate_pct=expected_conv_rate,
+        gross_margin_pct=gross_margin_pct,
+    )
+    projected_conversions = sim_result["projected_conversions"]
+    projected_gross_revenue = sim_result["projected_gross_revenue"]
+    projected_gross_profit = sim_result["projected_gross_profit"]
+    net_incremental_profit = sim_result["net_incremental_profit"]
+    campaign_roi_pct = sim_result["campaign_roi_pct"]
+    cost_per_acquisition = sim_result["cost_per_acquisition"]
 
     with col_sim_results:
         st.markdown("### 📊 Projected Financial ROI")
@@ -1271,3 +1396,59 @@ with tab5:
             """,
             unsafe_allow_html=True
         )
+
+    st.markdown("---")
+    with st.expander("🤖 AI Budget Advisor: Compare Across All Segments", expanded=enable_roi_advisor):
+        st.caption(
+            f"Runs the SAME ROI formulas above across EVERY segment, splitting the "
+            f"${campaign_budget:,.2f} total campaign budget proportionally to segment "
+            "size, then has the LLM explain the comparison and recommend an "
+            "allocation — using ONLY the numbers in the table below, never invented "
+            "or recomputed figures. Off by default; enable via the sidebar. See "
+            "README § AI Budget Advisor (Optional)."
+        )
+        if enable_roi_advisor:
+            allocations_df = simulate_all_segment_allocations(rfmt_df, clv_df, total_budget=campaign_budget)
+
+            display_alloc = allocations_df.rename(columns={
+                "segment": "Segment",
+                "customer_count": "Customers",
+                "allocated_budget": "Allocated Budget ($)",
+                "avg_segment_aov": "Avg AOV ($)",
+                "projected_conversions": "Projected Conversions",
+                "projected_gross_profit": "Projected Gross Profit ($)",
+                "net_incremental_profit": "Net Incremental Profit ($)",
+                "campaign_roi_pct": "ROI (%)",
+                "cost_per_acquisition": "CPA ($)",
+            })
+            st.dataframe(
+                display_alloc.style.format({
+                    "Allocated Budget ($)": "${:,.2f}",
+                    "Avg AOV ($)": "${:,.2f}",
+                    "Projected Conversions": "{:.1f}",
+                    "Projected Gross Profit ($)": "${:,.2f}",
+                    "Net Incremental Profit ($)": "${:,.2f}",
+                    "ROI (%)": "{:+.1f}%",
+                    "CPA ($)": "${:,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            roi_question = st.text_input(
+                "Budget goal",
+                value="Recommend the best way to split this budget across segments.",
+                help="A natural-language goal for the advisor -- e.g. \"maximize total ROI%\" or \"maximize absolute profit\".",
+                key="roi_advisor_question"
+            )
+            recommendation = cached_get_roi_recommendation(
+                roi_question, allocations_df, campaign_budget,
+                anthropic_api_key=anthropic_api_key,
+                groq_api_key=groq_api_key,
+                provider_override=digest_provider_override,
+            )
+            st.markdown(escape_markdown_dollar_signs(recommendation))
+            if not anthropic_api_key and not groq_api_key:
+                st.caption("ℹ️ Configure GROQ_API_KEY (free) or ANTHROPIC_API_KEY to enable the AI recommendation.")
+        else:
+            st.info("Enable \"AI Budget Advisor\" in the sidebar to compare projected ROI across all segments.")

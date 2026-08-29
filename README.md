@@ -32,9 +32,11 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
 10. [Connecting a Shopify Store](#-connecting-a-shopify-store)
 11. [AI Executive Summary (Optional)](#-ai-executive-summary-optional)
 12. [Chat Q&A (Optional)](#-chat-qa-optional)
-13. [Automated Testing Suite](#-automated-testing-suite)
-14. [Model Validation & Backtest Results](#-model-validation--backtest-results)
-15. [Strategic Business Use Cases](#-strategic-business-use-cases)
+13. [AI Budget Advisor (Optional)](#-ai-budget-advisor-optional)
+14. [Cohort Pattern Narration (Optional)](#-cohort-pattern-narration-optional)
+15. [Automated Testing Suite](#-automated-testing-suite)
+16. [Model Validation & Backtest Results](#-model-validation--backtest-results)
+17. [Strategic Business Use Cases](#-strategic-business-use-cases)
 
 ---
 
@@ -338,6 +340,7 @@ The application (`app.py`) shows a global KPI banner — Total Customers, Active
 1. **📊 Executive KPI & Cohort Matrix**:
    - Monthly acquisition cohort retention triangle (interactive Plotly heatmap), capped at 13 cohort-index columns by default (`compute_monthly_cohort_matrix(..., max_months=13)`, configurable).
    - Average Customer Retention Decay curve, plus Month 1 / Month 3 / Month 6 retention benchmarks.
+   - Optional **🔍 Notable Pattern** callout: a deterministic z-score scan flags the single most statistically unusual cohort-month cell, with an optional LLM plain-language explanation — see [Cohort Pattern Narration](#-cohort-pattern-narration-optional) below.
 
 2. **🎯 RFM-T Rule Segmentation**:
    - Segment Revenue & Volume Hierarchy Treemap and a Customer Volume vs. Revenue Contribution donut chart.
@@ -359,6 +362,7 @@ The application (`app.py`) shows a global KPI banner — Total Customers, Active
    - Real-time projected revenue, net incremental profit, ROI %, and cost per converted order.
    - Segment-specific playbook card with recommended channel/promotion, action items, and a ready-to-use campaign copy blueprint.
    - CSV export of the targeted audience list.
+   - Optional **🤖 AI Budget Advisor**: runs the same ROI math across every segment at once and has an LLM recommend a budget split — see [AI Budget Advisor](#-ai-budget-advisor-optional) below.
 
 *(Two figures above the tabs — the full-intelligence CSV export button and the KPI banner — are not tab-scoped; they reflect whatever dataset/column-mapping/snapshot-date is currently selected in the sidebar.)*
 
@@ -387,16 +391,20 @@ rfm-customer-intelligence-engine/
 │   ├── chat_context.py                # Chat Q&A: builds the context blob (once per batch run; mostly aggregate)
 │   ├── chat_engine.py                 # Optional Chat Q&A over the context blob (Groq free tier / Anthropic)
 │   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
-│   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
+│   ├── cohort_engine.py               # Monthly acquisition cohort matrix, Plotly retention heatmaps, & the deterministic notable-pattern z-score scan
+│   ├── cohort_narration.py            # Optional LLM narration of a single, deterministically-identified cohort pattern (Groq free tier / Anthropic)
 │   ├── digest_engine.py               # Optional per-account AI Executive Summary (Groq free tier / Anthropic)
 │   ├── ml_engine.py                   # Log-transform, StandardScaler, K-Means & 3D PCA decomposition
 │   ├── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
+│   ├── roi_advisor.py                 # Campaign ROI formulas (single source of truth) + optional multi-segment AI Budget Advisor
 │   └── shopify_ingest.py              # Shopify Admin API order ingest (maps to the pipeline schema)
 ├── tests/
 │   ├── test_chat_context.py           # Chat context blob: PII-exclusion, aggregate-structure tests
 │   ├── test_chat_engine.py            # Chat Q&A: fallback path, multi-turn, cost-model tests
+│   ├── test_cohort_narration.py       # Notable-pattern z-score scan (known-anomaly fixture) + narration fallback/cost-model tests
 │   ├── test_digest_engine.py          # AI digest: fallback path, prompt-content, cost-model tests
 │   ├── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
+│   ├── test_roi_advisor.py            # ROI formulas (hand-calculated), multi-segment allocation, advisor fallback/cost-model tests
 │   └── test_shopify_ingest.py         # Shopify ingest: pagination, rate-limit backoff, schema tests
 ├── test_enterprise_pipeline.py        # Standalone regression script covering all 5 engines
 └── tools/
@@ -508,7 +516,7 @@ The access token needs the `read_orders` scope. Create one via a [custom app](ht
 
 ### Cost impact
 
-Shopify's Admin REST API has no per-call charge at this data volume for a standard/custom app — calls are governed only by Shopify's leaky-bucket rate limit (handled above), not billed per request. That means this integration lands entirely in the **"Ingest & Pipeline"** cost category as a small, near-zero addition (bounded by `max_pages` per sync click) — it does **not** touch the **"Model / API Inference"** cost category, which remains $0 for the scoring pipeline itself (see [AI Executive Summary](#-ai-executive-summary-optional) below for the one feature that does call an LLM, and its own separate cost accounting).
+Shopify's Admin REST API has no per-call charge at this data volume for a standard/custom app — calls are governed only by Shopify's leaky-bucket rate limit (handled above), not billed per request. That means this integration lands entirely in the **"Ingest & Pipeline"** cost category as a small, near-zero addition (bounded by `max_pages` per sync click) — it does **not** touch the **"Model / API Inference"** cost category, which remains $0 for the scoring pipeline itself (see [AI Executive Summary](#-ai-executive-summary-optional) below for the first of the four optional features that do call an LLM, each with its own separate cost accounting).
 
 ### Out of scope for this integration (by design)
 
@@ -520,7 +528,7 @@ Shopify's Admin REST API has no per-call charge at this data volume for a standa
 
 ## 🤖 AI Executive Summary (Optional)
 
-**Model / Intelligence Inference, restated plainly:** RFM-T scoring, K-Means/PCA clustering, and the CLV/churn model (`src/rfm_engine.py`, `src/ml_engine.py`, `src/clv_engine.py`) remain **100% baked-in and zero-API** — unchanged by this feature. The AI Executive Summary described below is the **one optional exception**, off by default, and scoped and cost-accounted exactly as follows.
+**Model / Intelligence Inference, restated plainly:** RFM-T scoring, K-Means/PCA clustering, and the CLV/churn model (`src/rfm_engine.py`, `src/ml_engine.py`, `src/clv_engine.py`) remain **100% baked-in and zero-API** — unchanged by this feature. The AI Executive Summary described below is the **first of four optional exceptions** (alongside Chat Q&A, the AI Budget Advisor, and Cohort Pattern Narration, each documented in its own section below), each off by default, and each scoped and cost-accounted exactly as follows.
 
 ### What it does
 
@@ -604,6 +612,41 @@ Enable via its own sidebar checkbox ("Enable Chat Q&A — uses the same API key 
 
 ---
 
+## 💰 AI Budget Advisor (Optional)
+
+**A third optional AI feature, off by default, built on top of the existing What-If ROI Simulator (Tab 5) — not a replacement for it.** The single-segment slider simulator above it is unchanged. This adds a **comparison mode**: given the same total campaign budget already entered in the sliders, `simulate_all_segment_allocations()` (`src/roi_advisor.py`) runs the identical deterministic ROI math across **every** segment at once — splitting the budget proportionally to segment size — and displays the resulting table. An LLM then explains that comparison and recommends an allocation, reading **only** the numbers already in the table.
+
+### One formula, one place
+
+`simulate_campaign_roi()` (`src/roi_advisor.py`) is now the single source of truth for this platform's ROI math — the same formulas documented in [What-If Campaign ROI Simulation Framework](#-what-if-campaign-roi-simulation-framework) above. The single-segment slider simulator in Tab 5 calls this function directly (the math used to live inline in `app.py`; it was extracted here so it exists in exactly one place), and the multi-segment advisor calls the same function once per segment — neither path duplicates the arithmetic.
+
+### The LLM never computes a number
+
+`get_roi_recommendation()`'s system prompt explicitly instructs the model to compare, rank, and reason about the figures in the table — never to invent or recompute a new ROI, conversion count, or profit figure. The displayed comparison table (a plain `st.dataframe`, not LLM output) and the recommendation text are always shown together, so the analyst can verify every number the model cites against the table right above it.
+
+### Assumptions, stated plainly
+
+Every segment shares the SAME conversion-rate and gross-margin assumptions the single-segment simulator's own sliders default to (`DEFAULT_CONV_RATE_PCT` = 8.5%, `DEFAULT_GROSS_MARGIN_PCT` = 40%) unless a per-segment override is passed to `simulate_all_segment_allocations()` — segment-specific conversion-rate assumptions were explicitly out of scope for the task that added this feature, not something to guess at. Audience size per segment is that segment's full population (100% reach) — the advisor answers "how should I split my budget across segments," not "how deep should I reach into any one segment" (that remains the single-segment simulator's own reach slider).
+
+### Providers, cost model, credentials — reused, not re-derived
+
+Same `_resolve_provider()` Groq-preferred-by-default logic, same shared `_call_groq()`/`_call_anthropic()` functions, same `GROQ_API_KEY`/`ANTHROPIC_API_KEY`/`DIGEST_PROVIDER` configuration as the AI Digest and Chat Q&A above — see those sections for the full rationale, not repeated here. Enable via its own sidebar checkbox ("Enable AI Budget Advisor"), **off by default**, independent of the other AI checkboxes. The recommendation call is cached (`st.cache_data`, keyed on the question/table/budget/keys) for the same reason the digest and chat context are cached. No key configured is not an error: the comparison table always renders (pure deterministic math); only the narrated recommendation shows a clear "advisor temporarily unavailable" message instead of crashing.
+
+---
+
+## 🔍 Cohort Pattern Narration (Optional)
+
+**A fourth optional AI feature, off by default, built on top of the existing Monthly Acquisition Cohort Retention heatmap (Tab 1).** This is deliberately split into two independent steps:
+
+1. **Deterministic finding (zero API cost, always computed when this section is enabled).** `find_notable_cohort_pattern()` (`src/cohort_engine.py`) is a plain pandas/numpy z-score scan of the SAME retention matrix already rendered as a heatmap — no LLM call, no network access. For each months-since-acquisition column (Month 0 excluded — every cohort is 100% retained there by construction, so it carries no signal), it computes that column's mean and population standard deviation across every cohort that has reached that month, then finds the single cell with the largest `|z-score|` across the whole matrix. A column needs at least 3 cohorts with data before it's considered at all (`NOTABLE_COHORT_MIN_COLUMN_SAMPLES`) — with only two cohorts, both are always exactly ±1 standard deviation from their shared mean by construction, a relative ranking between two points rather than a genuine "stands out from several peers" finding.
+2. **Optional LLM narration, on top of step 1's finding — never in place of it.** `narrate_cohort_pattern()` (`src/cohort_narration.py`) takes ONLY the already-identified finding (cohort, month, the numbers) and asks an LLM for one or two plain-language sentences explaining it to a non-technical reader. It is never handed the raw matrix, and never asked to find the pattern itself — letting a model eyeball a whole matrix and guess which cell "looks interesting" would be expensive, nondeterministic, and untestable, exactly what step 1 exists to avoid.
+
+Because step 1 is real, useful information entirely on its own, the **🔍 Notable Pattern** callout always shows the deterministic finding (which cohort, which month, the exact deviation and z-score) whenever this section's checkbox is enabled — regardless of whether an API key is configured. The LLM narration is additive polish underneath it, not the only source of the finding: with no key configured, the callout shows the raw numeric finding alone, with a caption pointing at how to enable the plain-language version, rather than a "temporarily unavailable" placeholder.
+
+Same provider reuse, cost model, and credentials as the AI Digest, Chat Q&A, and AI Budget Advisor above. Enable via its own sidebar checkbox ("Enable Cohort Pattern Narration"), **off by default**. There is at most one notable pattern per batch run (the function returns a single finding, not a list), so this can never scale per-customer or per-cohort the way a rejected per-record design would; the narration call is cached the same way the other AI features are.
+
+---
+
 ## 🧪 Automated Testing Suite
 
 The repository has two complementary test layers, both run automatically on every push/PR by [GitHub Actions](.github/workflows/test.yml) (see the Build badge at the top of this README for current status):
@@ -621,7 +664,7 @@ python test_enterprise_pipeline.py
 5. `[5/6] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, 100% Month 0 retention identity, and the configurable month cap.
 6. `[6/6] Input Validation & Error Handling`: Confirms unmappable columns, all-rows-filtered datasets, and single-row datasets are all handled correctly (no crash, or a clear `RFMPipelineError`).
 
-**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`, `tests/test_digest_engine.py`, `tests/test_chat_context.py`, `tests/test_chat_engine.py`) — function-level unit tests with measured coverage. The Shopify, AI Digest, and Chat Q&A suites mock every external call (via `responses` and `unittest.mock` respectively) — no real network calls are made by the test suite:
+**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`, `tests/test_digest_engine.py`, `tests/test_chat_context.py`, `tests/test_chat_engine.py`, `tests/test_roi_advisor.py`, `tests/test_cohort_narration.py`) — function-level unit tests with measured coverage. The Shopify, AI Digest, Chat Q&A, AI Budget Advisor, and Cohort Pattern Narration suites mock every external call (via `responses` and `unittest.mock` respectively) — no real network calls are made by the test suite:
 
 ```bash
 pip install -r requirements-dev.txt
@@ -632,15 +675,17 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 
 | Module | Statements | Coverage |
 |:---|---:|---:|
-| `src/chat_context.py` | 67 | 100% |
+| `src/chat_context.py` | 69 | 100% |
 | `src/chat_engine.py` | 28 | 100% |
 | `src/clv_engine.py` | 42 | 100% |
-| `src/cohort_engine.py` | 56 | 100% |
+| `src/cohort_engine.py` | 80 | 100% |
+| `src/cohort_narration.py` | 22 | 100% |
 | `src/digest_engine.py` | 132 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
 | `src/rfm_engine.py` | 155 | 100% |
+| `src/roi_advisor.py` | 55 | 100% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **650** | **99%** |
+| **Total** | **753** | **99%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 
