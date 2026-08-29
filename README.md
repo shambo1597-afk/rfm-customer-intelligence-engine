@@ -31,9 +31,10 @@ An enterprise-grade, end-to-end customer intelligence platform designed to trans
 9. [Installation & Quickstart Guide](#-installation--quickstart-guide)
 10. [Connecting a Shopify Store](#-connecting-a-shopify-store)
 11. [AI Executive Summary (Optional)](#-ai-executive-summary-optional)
-12. [Automated Testing Suite](#-automated-testing-suite)
-13. [Model Validation & Backtest Results](#-model-validation--backtest-results)
-14. [Strategic Business Use Cases](#-strategic-business-use-cases)
+12. [Chat Q&A (Optional)](#-chat-qa-optional)
+13. [Automated Testing Suite](#-automated-testing-suite)
+14. [Model Validation & Backtest Results](#-model-validation--backtest-results)
+15. [Strategic Business Use Cases](#-strategic-business-use-cases)
 
 ---
 
@@ -383,6 +384,8 @@ rfm-customer-intelligence-engine/
 ├── sample_transactions.csv            # Compatibility transaction dataset
 ├── src/
 │   ├── __init__.py                    # Module export definitions
+│   ├── chat_context.py                # Chat Q&A: builds the aggregate-only context blob (once per batch run)
+│   ├── chat_engine.py                 # Optional Chat Q&A over the context blob (Gemini free tier / Anthropic)
 │   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
 │   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
 │   ├── digest_engine.py               # Optional per-account AI Executive Summary (Gemini free tier / Anthropic)
@@ -390,6 +393,8 @@ rfm-customer-intelligence-engine/
 │   ├── rfm_engine.py                  # RFM-T scoring, 7-segment taxonomy, & marketing playbooks
 │   └── shopify_ingest.py              # Shopify Admin API order ingest (maps to the pipeline schema)
 ├── tests/
+│   ├── test_chat_context.py           # Chat context blob: PII-exclusion, aggregate-structure tests
+│   ├── test_chat_engine.py            # Chat Q&A: fallback path, multi-turn, cost-model tests
 │   ├── test_digest_engine.py          # AI digest: fallback path, prompt-content, cost-model tests
 │   ├── test_pipeline.py               # pytest suite (see also test_enterprise_pipeline.py)
 │   └── test_shopify_ingest.py         # Shopify ingest: pagination, rate-limit backoff, schema tests
@@ -568,6 +573,32 @@ Set `GEMINI_API_KEY` and/or `ANTHROPIC_API_KEY` via `st.secrets` or an environme
 
 ---
 
+## 💬 Chat Q&A (Optional)
+
+**A second, separate optional AI feature, off by default, alongside the AI Executive Summary above — not a replacement for it.** Where the digest generates one static paragraph per batch run, Chat Q&A lets you ask natural-language follow-up questions ("what's my churn risk breakdown?", "which segment dominates my growth targets?") about the same account, back and forth, in a real conversation.
+
+### What it does — and deliberately does NOT do
+
+This is a **constrained Q&A chatbot over precomputed aggregate data**, not an open-ended agent:
+
+- **What it does:** answers questions using ONLY a structured context blob (`src/chat_context.py`) built **once per batch run** — the same cadence as the AI Digest — from output the pipeline has already computed: the segment breakdown, the churn watchlist (size, value, composition), top 90-day growth targets (size, value, composition), average cohort retention by month-since-acquisition, and the Segment × ML Cluster agreement summary. If a question asks for something not in that blob, the model is instructed to say so plainly rather than guess.
+- **What it will NOT do:**
+  - **No live tool-calling.** The model never calls back into `src/rfm_engine.py`, `src/clv_engine.py`, or any other engine mid-conversation — the context blob is fixed for the whole session, built before the chat UI is even shown.
+  - **No raw per-customer lookups.** The blob is 100% aggregate — no `CustomerID`, no individual transaction rows — the exact same PII posture as the AI Digest's `_build_aggregate_stats()` (see `tests/test_chat_context.py`'s PII-exclusion test, which mirrors the digest's own).
+  - **No hypothetical/what-if scenarios.** "What if I raised prices 10%?" is exactly the kind of question this feature is instructed to decline honestly rather than fabricate an answer for — verified manually against a live API key: it responds "I can't answer that from the current data" rather than inventing a number.
+
+### Cost model — usage-based, NOT the digest's fixed per-batch-run cost
+
+State this plainly rather than imply chat inherits the digest's tight bound: this is **one LLM call per question asked**, not one call per account per batch run. That is a genuinely different cost shape from the AI Digest, not a variant of it — usage-based rather than fixed. The practical bound: an analyst reviewing one account in one sitting asks maybe 5–20 questions, each a small prompt (the context blob is kept compact) against a short, capped answer — still trivial token cost per sitting on Gemini's Flash-Lite tier at pilot volume (same pricing-verification caveat as the AI Digest above applies here unchanged). But unlike the digest, there is **no hard ceiling** on how many questions a session can ask — this feature does not implement its own per-session budgeting; it relies on each provider's own account-level rate limits (the same `429`/`RESOURCE_EXHAUSTED` handling already built for the digest) as the practical backstop. See `src/chat_engine.py`'s module docstring for the full reasoning.
+
+### Providers, model, and credentials — all reused from the AI Digest, not re-derived
+
+Chat Q&A shares everything provider-related with the AI Digest above rather than defining its own: the same `_resolve_provider()` Gemini-preferred-by-default logic, the same currently-confirmed-working `GEMINI_MODEL_ID`/`MODEL_ID`, and the same error-handling classes for each provider. Multi-turn context uses each provider's own native mechanism — Gemini's `previous_interaction_id` chaining (no need to resend prior turns' text), Anthropic's standard `messages` list — rather than a third abstraction layered on top.
+
+Enable via its own sidebar checkbox ("Enable Chat Q&A — uses the same API key as AI Digest"), **off by default**, independent of the AI Digest checkbox — you can enable either, both, or neither. It reads the same `GEMINI_API_KEY`/`ANTHROPIC_API_KEY`/`DIGEST_PROVIDER` configuration. No key configured is not an error: the chat panel shows a clear "configure a key" message instead of crashing, exactly like the digest's graceful degradation.
+
+---
+
 ## 🧪 Automated Testing Suite
 
 The repository has two complementary test layers, both run automatically on every push/PR by [GitHub Actions](.github/workflows/test.yml) (see the Build badge at the top of this README for current status):
@@ -585,7 +616,7 @@ python test_enterprise_pipeline.py
 5. `[5/6] Cohort Retention Triangle Engine`: Validates triangle matrix shape, index calculation, 100% Month 0 retention identity, and the configurable month cap.
 6. `[6/6] Input Validation & Error Handling`: Confirms unmappable columns, all-rows-filtered datasets, and single-row datasets are all handled correctly (no crash, or a clear `RFMPipelineError`).
 
-**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`, `tests/test_digest_engine.py`) — function-level unit tests with measured coverage. The Shopify and AI Digest suites mock every external call (via `responses` and `unittest.mock` respectively) — no real network calls are made by the test suite:
+**2. `pytest` suite** (`tests/test_pipeline.py`, `tests/test_shopify_ingest.py`, `tests/test_digest_engine.py`, `tests/test_chat_context.py`, `tests/test_chat_engine.py`) — function-level unit tests with measured coverage. The Shopify, AI Digest, and Chat Q&A suites mock every external call (via `responses` and `unittest.mock` respectively) — no real network calls are made by the test suite:
 
 ```bash
 pip install -r requirements-dev.txt
@@ -596,13 +627,15 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 
 | Module | Statements | Coverage |
 |:---|---:|---:|
+| `src/chat_context.py` | 40 | 100% |
+| `src/chat_engine.py` | 70 | 100% |
 | `src/clv_engine.py` | 42 | 100% |
 | `src/cohort_engine.py` | 56 | 100% |
-| `src/digest_engine.py` | 59 | 100% |
+| `src/digest_engine.py` | 115 | 100% |
 | `src/ml_engine.py` | 59 | 98% |
 | `src/rfm_engine.py` | 155 | 100% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **482** | **99%** |
+| **Total** | **648** | **99%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 
