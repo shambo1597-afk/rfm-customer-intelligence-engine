@@ -12,6 +12,7 @@ from src.chat_context import (
     build_account_context_blob,
     build_context_text,
     build_methodology_context,
+    CHAT_SEGMENT_PLAYBOOKS,
     GROWTH_TARGETS_TOP_N,
     WATCHLIST_CHAT_ROW_CAP,
     GROWTH_TARGET_CHAT_ROW_CAP,
@@ -36,7 +37,7 @@ class TestBlobStructure:
         assert set(context_blob.keys()) == {
             "aggregate_stats", "segment_breakdown", "churn_watchlist",
             "growth_targets", "cohort_retention_by_month", "segment_cluster_crosstab",
-            "methodology",
+            "methodology", "segment_playbooks",
         }
 
     def test_aggregate_stats_matches_digest_engines_own_function_exactly(
@@ -441,3 +442,110 @@ class TestContextTextIncludesMethodologySection:
 
     def test_honest_bottom_line_appears_verbatim_in_spirit(self, context_text):
         assert "does NOT beat the simplest baseline" in context_text
+
+
+class TestSegmentPlaybooksCrossReferenceReadme:
+    """
+    The actual point of this test class, same spirit as
+    TestMethodologyContextCrossReferencesReadme above: CHAT_SEGMENT_PLAYBOOKS
+    must contain the SAME per-segment recommendations as README's "Enterprise
+    7-Segment Taxonomy & Marketing Playbooks" table -- not just "playbook
+    content exists somewhere" but "the specific, checkable Recommended
+    Promotion text for THIS segment is present and attributed to THIS
+    segment, not some other one." Expected values below were copied by hand
+    from README.md at the time this test was written (not derived from the
+    constant under test) -- if the README table is ever edited, this test
+    should fail until README.md and this file are updated together.
+    """
+
+    def test_covers_exactly_the_seven_taxonomy_segments(self):
+        assert set(CHAT_SEGMENT_PLAYBOOKS.keys()) == {
+            "Champions", "Loyalists", "Potential Growth", "At-Risk VIPs",
+            "Can't Lose Them", "Hibernating", "New Customers",
+        }
+
+    def test_every_segment_has_the_documented_three_fields(self):
+        for segment, playbook in CHAT_SEGMENT_PLAYBOOKS.items():
+            assert set(playbook.keys()) == {
+                "primary_objective", "best_channels", "recommended_promotion",
+            }, segment
+
+    @pytest.mark.parametrize(
+        "segment, expected_promotion_substring",
+        [
+            ("Champions", "Early access"),
+            ("Loyalists", "Curated bundles"),
+            ("Potential Growth", "$25 credit"),
+            ("At-Risk VIPs", "20–25% reactivation coupon"),
+            ("Can't Lose Them", "Aggressive 30% discount"),
+            ("Hibernating", "up to 40% off"),
+            ("New Customers", "$15 off within 21 days"),
+        ],
+    )
+    def test_recommended_promotion_matches_readme_and_is_not_misattributed(
+        self, segment, expected_promotion_substring
+    ):
+        # Positive: the distinctive, checkable promotion text for THIS segment
+        # is present under THIS segment's key.
+        assert expected_promotion_substring in CHAT_SEGMENT_PLAYBOOKS[segment]["recommended_promotion"]
+        # Negative: it must NOT appear under any OTHER segment's promotion --
+        # guards against copy-paste misattribution between rows.
+        for other_segment, other_playbook in CHAT_SEGMENT_PLAYBOOKS.items():
+            if other_segment == segment:
+                continue
+            assert expected_promotion_substring not in other_playbook["recommended_promotion"], (
+                f"{expected_promotion_substring!r} (belongs to {segment}) leaked into {other_segment}"
+            )
+
+    def test_best_channels_match_readme(self):
+        # Source: README's "Best Channels" column, copied verbatim.
+        assert CHAT_SEGMENT_PLAYBOOKS["Champions"]["best_channels"] == "VIP Concierge, Direct Email"
+        assert CHAT_SEGMENT_PLAYBOOKS["Can't Lose Them"]["best_channels"] == "Executive Email, Phone Concierge"
+        assert CHAT_SEGMENT_PLAYBOOKS["Hibernating"]["best_channels"] == "Automated Re-permission, Social"
+
+    def test_hibernating_objective_says_liquidation_not_reactivation(self):
+        # Regression guard for the specific wording drift found (and
+        # deliberately NOT reused) in src/rfm_engine.py's own, differently-
+        # scoped SEGMENT_PLAYBOOKS constant: that dict's Hibernating entry
+        # says "Low-cost reactivation" -- README says "Low-cost liquidation",
+        # a genuinely different concept. This constant must match README.
+        objective = CHAT_SEGMENT_PLAYBOOKS["Hibernating"]["primary_objective"]
+        assert "liquidation" in objective.lower()
+        assert "reactivation" not in objective.lower()
+
+
+class TestContextTextIncludesSegmentPlaybooksSection:
+    """Confirms build_context_text() actually serializes the segment-playbooks
+    section (not just that build_account_context_blob() carries it in the
+    dict) -- this is what the model actually sees in the system prompt, and
+    what src/chat_engine.py's system prompt instructs it to cross-reference
+    against a customer's Segment."""
+
+    def test_segment_playbooks_section_header_is_present(self, context_text):
+        assert "SEGMENT PLAYBOOKS" in context_text
+
+    @pytest.mark.parametrize(
+        "segment, expected_promotion_substring",
+        [
+            ("Champions", "Early access"),
+            ("Loyalists", "Curated bundles"),
+            ("Potential Growth", "$25 credit"),
+            ("At-Risk VIPs", "20–25% reactivation coupon"),
+            ("Can't Lose Them", "Aggressive 30% discount"),
+            ("Hibernating", "up to 40% off"),
+            ("New Customers", "$15 off within 21 days"),
+        ],
+    )
+    def test_each_segments_promotion_text_appears_in_serialized_text(
+        self, context_text, segment, expected_promotion_substring
+    ):
+        assert expected_promotion_substring in context_text
+
+    def test_cant_lose_them_promotion_is_not_misattributed_to_another_segment_in_text(self, context_text):
+        # The concrete example from the task spec: "30% discount" must appear
+        # specifically on Can't Lose Them's line, not floating free of it or
+        # attached to a different segment's line.
+        lines = context_text.splitlines()
+        matching_lines = [line for line in lines if "Aggressive 30% discount" in line]
+        assert len(matching_lines) == 1
+        assert "Can't Lose Them" in matching_lines[0]
