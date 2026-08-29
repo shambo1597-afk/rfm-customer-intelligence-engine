@@ -13,6 +13,10 @@ from src.chat_context import (
     build_context_text,
     build_methodology_context,
     GROWTH_TARGETS_TOP_N,
+    WATCHLIST_CHAT_ROW_CAP,
+    GROWTH_TARGET_CHAT_ROW_CAP,
+    _watchlist_rows_for_chat,
+    _growth_target_rows_for_chat,
 )
 from src.digest_engine import _build_aggregate_stats
 
@@ -50,16 +54,38 @@ class TestBlobStructure:
                 "revenue_share_pct", "avg_recency_days", "avg_frequency", "avg_tenure_days",
             }
 
-    def test_churn_watchlist_is_aggregate_only(self, context_blob):
+    def test_churn_watchlist_has_the_documented_keys_including_individual_rows(self, context_blob):
+        # "aggregate-only" is no longer accurate for this sub-dict as of the
+        # individual-row exposure change -- see
+        # TestIndividualCustomerExposureIsScopedToWatchlistAndGrowthTargets
+        # below for what individual_rows is actually allowed to contain.
         watchlist = context_blob["churn_watchlist"]
-        assert set(watchlist.keys()) == {"count", "total_value", "avg_p_alive_pct", "segment_composition"}
+        assert set(watchlist.keys()) == {
+            "count", "total_value", "avg_p_alive_pct", "segment_composition", "individual_rows",
+        }
         assert isinstance(watchlist["count"], int)
         assert isinstance(watchlist["segment_composition"], dict)
+        assert isinstance(watchlist["individual_rows"], list)
+        assert len(watchlist["individual_rows"]) <= WATCHLIST_CHAT_ROW_CAP
+        for row in watchlist["individual_rows"]:
+            assert set(row.keys()) == {
+                "customer_id", "monetary", "recency_days", "frequency",
+                "segment", "p_alive_pct", "churn_risk_tier",
+            }
 
-    def test_growth_targets_is_aggregate_only_and_respects_top_n(self, clv_df, context_blob):
+    def test_growth_targets_respects_top_n_and_has_the_documented_keys(self, clv_df, context_blob):
         growth = context_blob["growth_targets"]
-        assert set(growth.keys()) == {"count", "total_predicted_90d_value", "segment_composition"}
+        assert set(growth.keys()) == {
+            "count", "total_predicted_90d_value", "segment_composition", "individual_rows",
+        }
         assert growth["count"] <= min(GROWTH_TARGETS_TOP_N, len(clv_df))
+        assert isinstance(growth["individual_rows"], list)
+        assert len(growth["individual_rows"]) <= GROWTH_TARGET_CHAT_ROW_CAP
+        for row in growth["individual_rows"]:
+            assert set(row.keys()) == {
+                "customer_id", "monetary", "recency_days", "frequency",
+                "segment", "predicted_spend_90d",
+            }
 
     def test_cohort_retention_by_month_is_a_flat_month_to_pct_dict(self, context_blob):
         cohort = context_blob["cohort_retention_by_month"]
@@ -113,14 +139,6 @@ class TestGracefulDegradationOnMissingOptionalInputs:
 
 
 class TestContextTextContainsOnlyAggregateData:
-    """Mirrors tests/test_digest_engine.py::test_prompt_never_contains_a_raw_customer_id
-    exactly -- same guarantee, same test shape, applied to this module's serialized
-    context blob instead of digest_engine.py's prompt."""
-
-    def test_context_text_never_contains_a_raw_customer_id(self, rfmt_df, context_text):
-        for customer_id in rfmt_df["CustomerID"].astype(str):
-            assert customer_id not in context_text
-
     def test_context_text_contains_the_documented_aggregate_totals(self, context_blob, context_text):
         stats = context_blob["aggregate_stats"]
         assert f"{stats['total_customers']:,}" in context_text
@@ -131,8 +149,133 @@ class TestContextTextContainsOnlyAggregateData:
     def test_context_text_stays_a_reasonable_size(self, context_text):
         # "Keep the blob a reasonable size" per the task spec -- a loose upper
         # bound (not a tight one) just to catch an accidental future regression
-        # toward per-row serialization, not to constrain normal growth.
-        assert len(context_text) < 8000
+        # toward per-row serialization of the FULL customer base, not to
+        # constrain normal growth. Raised from the pre-individual-rows bound
+        # to account for the watchlist/growth-target "Individual accounts"
+        # lines now included by design (see the class below).
+        assert len(context_text) < 20000
+
+
+class TestIndividualCustomerExposureIsScopedToWatchlistAndGrowthTargets:
+    """
+    Replaces the old blanket PII-exclusion test. As of the individual-row
+    exposure change (see src/chat_context.py's module docstring "PII posture"
+    section -- an informed decision, not an oversight, and one that does NOT
+    extend to real customer data), CustomerIDs from the churn watchlist and
+    growth-target lists ARE expected to appear in the context text. This
+    class asserts the exposure is exactly as scoped as intended: those
+    CustomerIDs DO appear (the feature actually works), and a CustomerID
+    belonging to NEITHER list does NOT appear (the exposure hasn't silently
+    widened to the full customer base).
+    """
+
+    def test_watchlist_and_growth_target_customer_ids_appear_in_context_text(self, context_blob, context_text):
+        watchlist_rows = context_blob["churn_watchlist"]["individual_rows"]
+        growth_rows = context_blob["growth_targets"]["individual_rows"]
+        # Sanity: individual_rows isn't accidentally empty for this dataset --
+        # otherwise the assertions below would trivially pass without testing
+        # anything.
+        assert len(watchlist_rows) > 0
+        assert len(growth_rows) > 0
+
+        for row in watchlist_rows:
+            assert row["customer_id"] in context_text
+        for row in growth_rows:
+            assert row["customer_id"] in context_text
+
+    def test_a_customer_id_in_neither_list_does_not_appear_in_context_text(
+        self, rfmt_df, context_blob, context_text
+    ):
+        exposed_ids = {r["customer_id"] for r in context_blob["churn_watchlist"]["individual_rows"]}
+        exposed_ids |= {r["customer_id"] for r in context_blob["growth_targets"]["individual_rows"]}
+
+        all_ids = set(rfmt_df["CustomerID"].astype(str))
+        unexposed_ids = all_ids - exposed_ids
+        assert unexposed_ids, "test setup problem: every customer is on one of the lists"
+
+        for customer_id in unexposed_ids:
+            assert customer_id not in context_text
+
+    def test_individual_row_fields_match_exactly_what_the_source_functions_return(
+        self, rfmt_df, clv_df, segment_summary, cohort_retention_matrix, crosstab_counts
+    ):
+        # Traceability: the numbers in individual_rows must be the SAME
+        # numbers get_urgent_churn_watchlist()/get_top_future_growth_targets()
+        # themselves produce for this dataset, not independently recomputed.
+        from src.clv_engine import get_urgent_churn_watchlist, get_top_future_growth_targets
+
+        watchlist_df = get_urgent_churn_watchlist(clv_df)
+        blob = build_account_context_blob(rfmt_df, clv_df, segment_summary, cohort_retention_matrix, crosstab_counts)
+        first_row = blob["churn_watchlist"]["individual_rows"][0]
+        source_row = watchlist_df.iloc[0]
+        assert first_row["customer_id"] == str(source_row["CustomerID"])
+        assert first_row["monetary"] == float(source_row["Monetary"])
+        assert first_row["recency_days"] == int(source_row["Recency"])
+        assert first_row["p_alive_pct"] == float(source_row["P_Alive_Pct"])
+        assert first_row["churn_risk_tier"] == str(source_row["Churn_Risk_Tier"])
+
+        growth_df = get_top_future_growth_targets(clv_df, top_n=GROWTH_TARGETS_TOP_N)
+        first_growth_row = blob["growth_targets"]["individual_rows"][0]
+        source_growth_row = growth_df.iloc[0]
+        assert first_growth_row["customer_id"] == str(source_growth_row["CustomerID"])
+        assert first_growth_row["predicted_spend_90d"] == float(source_growth_row["Predicted_Spend_90d"])
+
+
+class TestIndividualRowCapsAreRespected:
+    """Feeds more than the cap constants' worth of rows in and confirms the
+    output list is actually capped -- the task's explicit requirement."""
+
+    def test_watchlist_rows_capped_at_watchlist_chat_row_cap(self):
+        n = WATCHLIST_CHAT_ROW_CAP + 15
+        fake_watchlist = pd.DataFrame({
+            "CustomerID": [f"CUST-{i:04d}" for i in range(n)],
+            "Monetary": [1000.0 - i for i in range(n)],
+            "Recency": [10] * n,
+            "Frequency": [5] * n,
+            "Segment": ["At-Risk VIPs"] * n,
+            "P_Alive_Pct": [10.0] * n,
+            "Churn_Risk_Tier": ["🔴 High Churn Risk"] * n,
+        })
+        rows = _watchlist_rows_for_chat(fake_watchlist)
+        assert len(rows) == WATCHLIST_CHAT_ROW_CAP
+        # Confirms it takes the DataFrame's own existing (priority) order --
+        # the first N rows -- not an arbitrary/random subset.
+        assert rows[0]["customer_id"] == "CUST-0000"
+        assert rows[-1]["customer_id"] == f"CUST-{WATCHLIST_CHAT_ROW_CAP - 1:04d}"
+
+    def test_growth_target_rows_capped_at_growth_target_chat_row_cap(self):
+        n = GROWTH_TARGET_CHAT_ROW_CAP + 15
+        fake_growth = pd.DataFrame({
+            "CustomerID": [f"CUST-{i:04d}" for i in range(n)],
+            "Monetary": [1000.0 - i for i in range(n)],
+            "Recency": [10] * n,
+            "Frequency": [5] * n,
+            "Segment": ["Champions"] * n,
+            "Predicted_Spend_90d": [500.0 - i for i in range(n)],
+        })
+        rows = _growth_target_rows_for_chat(fake_growth)
+        assert len(rows) == GROWTH_TARGET_CHAT_ROW_CAP
+        assert rows[0]["customer_id"] == "CUST-0000"
+        assert rows[-1]["customer_id"] == f"CUST-{GROWTH_TARGET_CHAT_ROW_CAP - 1:04d}"
+
+    def test_fewer_rows_than_cap_are_not_truncated(self):
+        fake_watchlist = pd.DataFrame({
+            "CustomerID": ["CUST-0000", "CUST-0001", "CUST-0002"],
+            "Monetary": [100.0, 200.0, 300.0],
+            "Recency": [10, 20, 30],
+            "Frequency": [1, 2, 3],
+            "Segment": ["Hibernating"] * 3,
+            "P_Alive_Pct": [50.0] * 3,
+            "Churn_Risk_Tier": ["🟡 Moderate Watch"] * 3,
+        })
+        rows = _watchlist_rows_for_chat(fake_watchlist)
+        assert len(rows) == 3
+
+    def test_empty_dataframe_returns_empty_list(self):
+        assert _watchlist_rows_for_chat(pd.DataFrame()) == []
+        assert _growth_target_rows_for_chat(pd.DataFrame()) == []
+        assert _watchlist_rows_for_chat(None) == []
+        assert _growth_target_rows_for_chat(None) == []
 
 
 class TestEmptyOptionalSlicesDegradeToEmptyDicts:

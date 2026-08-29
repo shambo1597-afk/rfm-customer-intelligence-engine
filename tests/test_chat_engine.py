@@ -96,6 +96,22 @@ class TestSystemPromptInstructsScopeLimitation:
         prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob=context_text)
         assert context_text in prompt
 
+    def test_system_prompt_permits_referencing_watchlist_and_growth_target_customer_ids(self):
+        # Per the individual-row exposure change (see src/chat_context.py):
+        # the model must be told these two lists' CustomerIDs are legitimately
+        # available, so it doesn't over-apply the old blanket "no individual
+        # customers" refusal to data that's now actually in front of it.
+        prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob="dummy context")
+        assert "CHURN WATCHLIST" in prompt
+        assert "GROWTH TARGETS" in prompt
+        assert "legitimately available" in prompt
+        assert "which" in prompt.lower() and "who" in prompt.lower()
+
+    def test_system_prompt_still_scopes_refusal_to_customers_outside_the_two_lists(self):
+        prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob="dummy context")
+        assert "does NOT appear" in prompt
+        assert "not every customer on the account" in prompt.lower() or "not in the current watchlist" in prompt.lower()
+
 
 class TestFallbackPathNoKeys:
     def test_no_keys_returns_unavailable_message_without_any_network_call(self, context_text):
