@@ -20,9 +20,9 @@ import re
 import types
 from unittest.mock import MagicMock, patch
 
+import groq
 import httpx
 import pytest
-from google.genai._gaos.lib import compat_errors as genai_errors
 
 from src.chat_context import build_account_context_blob, build_context_text
 from src.chat_engine import (
@@ -31,26 +31,28 @@ from src.chat_engine import (
     CHAT_MAX_OUTPUT_TOKENS,
     CHAT_SYSTEM_PROMPT_TEMPLATE,
     _chat_unavailable,
-    _last_gemini_interaction_id,
-    _anthropic_messages_from_history,
 )
-from src.digest_engine import MODEL_ID, GEMINI_MODEL_ID, GEMINI_REQUEST_TIMEOUT_SECONDS
+from src.digest_engine import MODEL_ID, GROQ_MODEL_ID, GROQ_REQUEST_TIMEOUT_SECONDS
 
 
-def _make_gemini_api_error(status_code: int, message: str, reason: str = "", body: dict = None):
-    """Identical helper to tests/test_digest_engine.py's -- builds a real
-    genai_errors.APIStatusError subclass via the SDK's own status-code-to-class
-    factory. See that file's version for the full rationale; duplicated here
-    (not imported) since test files in this repo are self-contained."""
-    request = httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/interactions")
+def _make_groq_api_error(status_code: int, message: str = "error"):
+    """Identical helper to tests/test_digest_engine.py's -- builds a real groq
+    exception via the REAL groq.Groq client's own _make_status_error()
+    dispatch method (confirmed via direct introspection of the pinned groq
+    package, groq/_client.py -- not a guess). Duplicated here (not imported)
+    since test files in this repo are self-contained."""
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
     response = httpx.Response(status_code=status_code, request=request)
-    if body is None:
-        body = {"error": {"code": status_code, "message": message, "status": reason}}
-    return genai_errors.APIError.generate(
-        status_code=status_code,
-        body=body,
-        message=f"Error code: {status_code} - [{body}]",
-        response=response,
+    client = groq.Groq(api_key="dummy-key-for-error-construction")
+    return client._make_status_error(message, body=None, response=response)
+
+
+def _mock_groq_response(text="An answer."):
+    """Builds a fake groq ChatCompletion-shaped response -- response.choices[0].message.content
+    is the real path (confirmed via direct introspection of groq.types.chat), mirroring
+    tests/test_digest_engine.py's identical helper."""
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
     )
 
 
@@ -75,9 +77,9 @@ class TestNamedConstants:
         # are literally the same names digest_engine.py exports -- not a
         # separately re-guessed model string that could silently drift.
         import src.chat_engine as chat_engine_module
-        assert chat_engine_module.GEMINI_MODEL_ID is GEMINI_MODEL_ID
+        assert chat_engine_module.GROQ_MODEL_ID is GROQ_MODEL_ID
         assert chat_engine_module.MODEL_ID is MODEL_ID
-        assert chat_engine_module.GEMINI_REQUEST_TIMEOUT_SECONDS is GEMINI_REQUEST_TIMEOUT_SECONDS
+        assert chat_engine_module.GROQ_REQUEST_TIMEOUT_SECONDS is GROQ_REQUEST_TIMEOUT_SECONDS
 
 
 class TestSystemPromptInstructsScopeLimitation:
@@ -218,10 +220,10 @@ class TestFallbackPathNoKeys:
     def test_no_keys_returns_unavailable_message_without_any_network_call(self, context_text):
         history = []
         with patch("src.chat_engine.anthropic.Anthropic") as mock_anthropic_cls, \
-             patch("src.chat_engine.genai.Client") as mock_genai_cls:
+             patch("src.chat_engine.groq.Groq") as mock_groq_cls:
             result = answer_account_question("What's my churn risk?", context_text, history)
             mock_anthropic_cls.assert_not_called()
-            mock_genai_cls.assert_not_called()
+            mock_groq_cls.assert_not_called()
         assert "temporarily unavailable" in result
         # A failed turn is not recorded -- see the function's docstring.
         assert history == []
@@ -232,230 +234,227 @@ class TestFallbackPathNoKeys:
         assert "some reason" in result
 
 
-class TestSuccessfulGeminiCall:
+class TestSuccessfulGroqCall:
     def test_successful_call_returns_model_text_and_records_the_turn(self, context_text):
-        mock_interaction = types.SimpleNamespace(output_text="Your churn watchlist has 3 accounts.", id="interaction-1")
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response(
+            "Your churn watchlist has 3 accounts."
+        )
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
             result = answer_account_question(
-                "What's my churn risk?", context_text, history, gemini_api_key="fake-gemini-key"
+                "What's my churn risk?", context_text, history, groq_api_key="fake-groq-key"
             )
 
         assert result == "Your churn watchlist has 3 accounts."
         assert "temporarily unavailable" not in result
+        # Plain {"role", "content"} turns only -- no provider-specific
+        # bookkeeping key (Gemini's interaction-id chaining, and the key that
+        # went with it, is gone entirely -- see src/chat_engine.py's module
+        # docstring "Provider swap" note).
         assert history == [
             {"role": "user", "content": "What's my churn risk?"},
-            {"role": "assistant", "content": "Your churn watchlist has 3 accounts.", "gemini_interaction_id": "interaction-1"},
+            {"role": "assistant", "content": "Your churn watchlist has 3 accounts."},
         ]
 
-    def test_call_uses_the_digest_engines_gemini_model_and_chat_max_output_tokens(self, context_text):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="interaction-2")
+    def test_call_uses_the_digest_engines_groq_model_and_chat_max_output_tokens(self, context_text):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response()
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["model"] == GEMINI_MODEL_ID
-        assert kwargs["generation_config"]["max_output_tokens"] == CHAT_MAX_OUTPUT_TOKENS
-        assert kwargs["input"] == "A question?"
-        assert "previous_interaction_id" not in kwargs  # first turn -- no prior interaction to chain from
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        assert kwargs["model"] == GROQ_MODEL_ID
+        assert kwargs["max_tokens"] == CHAT_MAX_OUTPUT_TOKENS
+        # Last message is this turn's question.
+        assert kwargs["messages"][-1] == {"role": "user", "content": "A question?"}
 
-    def test_call_passes_the_per_call_timeout_kwarg_not_client_level_http_options(self, context_text):
-        # Fix for googleapis/python-genai#1893/#911 (see digest_engine.py's
-        # module docstring) -- the timeout MUST be the per-call `timeout=` kwarg
-        # on interactions.create(), confirmed working, NOT
-        # genai.Client(http_options=...), confirmed broken/unreliable.
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="interaction-timeout-kwarg")
+    def test_call_passes_the_timeout_via_with_options_not_a_per_call_kwarg(self, context_text):
+        # Mirrors Anthropic's own with_options(timeout=...) mechanism exactly
+        # (both SDKs support it) -- NOT Gemini's old per-call `timeout=` kwarg
+        # pattern, which no longer applies anywhere in this codebase.
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response()
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client) as mock_client_cls:
-            answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
-        _, client_kwargs = mock_client_cls.call_args
-        assert "http_options" not in client_kwargs
+        mock_client.with_options.assert_called_once_with(timeout=GROQ_REQUEST_TIMEOUT_SECONDS)
 
-    def test_system_instruction_carries_the_context_blob(self, context_text):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="interaction-3")
+    def test_system_prompt_carries_the_context_blob_as_the_first_message(self, context_text):
+        # Groq's OpenAI-compatible API has no separate top-level `system`
+        # field (unlike Anthropic's) -- the system prompt is the first entry
+        # in `messages` instead.
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response()
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert context_text in kwargs["system_instruction"]
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        first_message = kwargs["messages"][0]
+        assert first_message["role"] == "system"
+        assert context_text in first_message["content"]
 
     def test_empty_output_text_falls_back(self, context_text):
-        mock_interaction = types.SimpleNamespace(output_text="   ", id="interaction-4")
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response("   ")
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, history, gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, history, groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
-        assert "empty response from Gemini" in result
+        assert "empty response from Groq" in result
         assert history == []  # failed turn not recorded
 
 
-class TestGeminiMultiTurnChaining:
-    """Confirms conversation_history is actually passed through to the provider
-    call (via previous_interaction_id), not dropped -- the multi-turn
-    requirement from the task spec."""
+class TestGroqMultiTurnChaining:
+    """
+    Confirms conversation_history is genuinely threaded into the Groq call --
+    the multi-turn requirement from the task spec, now served by Groq's
+    plain, stateless messages-list pattern (system prompt + full history +
+    new question, resent in full every turn) rather than Gemini's old
+    stateful previous_interaction_id chaining, which is gone along with
+    Gemini itself (see src/chat_engine.py's module docstring "Multi-turn
+    conversation" section).
+    """
 
-    def test_second_turn_passes_the_first_turns_interaction_id_as_previous_interaction_id(self, context_text):
+    def test_second_turn_includes_the_full_conversation_history_in_messages(self, context_text):
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = [
-            types.SimpleNamespace(output_text="First answer.", id="turn-1-id"),
-            types.SimpleNamespace(output_text="Second answer.", id="turn-2-id"),
+        mock_client.with_options.return_value.chat.completions.create.side_effect = [
+            _mock_groq_response("First answer."),
+            _mock_groq_response("Second answer."),
         ]
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            answer_account_question("First question?", context_text, history, gemini_api_key="fake-gemini-key")
-            answer_account_question("Second question?", context_text, history, gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            answer_account_question("First question?", context_text, history, groq_api_key="fake-groq-key")
+            answer_account_question("Second question?", context_text, history, groq_api_key="fake-groq-key")
 
-        assert mock_client.interactions.create.call_count == 2
-        _, second_call_kwargs = mock_client.interactions.create.call_args_list[1]
-        assert second_call_kwargs["previous_interaction_id"] == "turn-1-id"
-        # system_instruction is re-sent on every turn (see module docstring),
-        # not just the first.
-        assert context_text in second_call_kwargs["system_instruction"]
-        # History now carries both turns, in order.
-        assert [t["content"] for t in history] == ["First question?", "First answer.", "Second question?", "Second answer."]
-
-    def test_last_gemini_interaction_id_helper_scans_backwards_for_the_most_recent(self):
-        history = [
-            {"role": "user", "content": "q1"},
-            {"role": "assistant", "content": "a1", "gemini_interaction_id": "old-id"},
-            {"role": "user", "content": "q2"},
-            {"role": "assistant", "content": "a2", "gemini_interaction_id": "newer-id"},
+        assert mock_client.with_options.return_value.chat.completions.create.call_count == 2
+        _, second_call_kwargs = mock_client.with_options.return_value.chat.completions.create.call_args_list[1]
+        # system + first Q + first A + second Q -- the model genuinely has
+        # the prior turn's content available, not just a chained opaque id.
+        assert second_call_kwargs["messages"][1:] == [
+            {"role": "user", "content": "First question?"},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Second question?"},
         ]
-        assert _last_gemini_interaction_id(history) == "newer-id"
+        assert context_text in second_call_kwargs["messages"][0]["content"]
+        # History now carries both turns, in order, as plain {"role", "content"} dicts.
+        assert history == [
+            {"role": "user", "content": "First question?"},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Second question?"},
+            {"role": "assistant", "content": "Second answer."},
+        ]
 
-    def test_last_gemini_interaction_id_helper_returns_none_for_empty_or_anthropic_only_history(self):
-        assert _last_gemini_interaction_id([]) is None
-        anthropic_only_history = [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
-        assert _last_gemini_interaction_id(anthropic_only_history) is None
 
-
-class TestGeminiFailuresDegradeGracefully:
+class TestGroqFailuresDegradeGracefully:
     def test_missing_key_falls_back_without_any_network_call(self, context_text):
-        with patch("src.chat_engine.genai.Client") as mock_client_cls:
-            result = answer_account_question("A question?", context_text, [], gemini_api_key=None)
+        with patch("src.chat_engine.groq.Groq") as mock_client_cls:
+            result = answer_account_question("A question?", context_text, [], groq_api_key=None)
             mock_client_cls.assert_not_called()
         assert "temporarily unavailable" in result
 
-    def test_genai_package_missing_falls_back(self, context_text):
-        with patch("src.chat_engine.genai", None):
-            result = answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+    def test_groq_package_missing_falls_back(self, context_text):
+        with patch("src.chat_engine.groq", None):
+            result = answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
         assert "temporarily unavailable" in result
         assert "not installed" in result
 
     def test_rate_limit_falls_back_with_specific_reason(self, context_text):
-        exc = _make_gemini_api_error(429, "quota exceeded", reason="RESOURCE_EXHAUSTED")
+        exc = _make_groq_api_error(429, "quota exceeded")
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, history, gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, history, groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
-        assert "Gemini free-tier rate limit reached" in result
+        assert "Groq free-tier rate limit reached" in result
         assert history == []
 
     def test_invalid_key_falls_back_with_specific_reason(self, context_text):
-        real_invalid_key_body = {
-            "error": {
-                "code": 400,
-                "message": "API key not valid. Please pass a valid API key.",
-                "status": "INVALID_ARGUMENT",
-                "details": [{"reason": "API_KEY_INVALID"}],
-            }
-        }
-        exc = _make_gemini_api_error(400, "API key not valid.", body=real_invalid_key_body)
+        # Standard HTTP 401 for bad credentials -- no Gemini-style body-shape
+        # sniffing needed here (see digest_engine.py's equivalent test).
+        exc = _make_groq_api_error(401, "bad credentials")
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, [], gemini_api_key="bad-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, [], groq_api_key="bad-key")
 
         assert "temporarily unavailable" in result
-        assert "invalid Gemini API key" in result
+        assert "invalid Groq API key" in result
 
     def test_generic_client_error_falls_back_with_generic_reason(self, context_text):
-        exc = _make_gemini_api_error(404, "not found")
+        exc = _make_groq_api_error(404, "not found")
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
-        assert "Gemini API error" in result
+        assert "Groq API error" in result
 
     def test_timeout_falls_back_with_its_own_distinct_reason_never_hangs_the_test(self, context_text):
-        # The actual bug this fix addresses: a hung client.interactions.create()
-        # call must never hang the caller. Mocking a raised APITimeoutError
-        # (rather than actually sleeping) proves the except clause routes to its
-        # own distinct reason -- if this test itself takes anywhere near
-        # GEMINI_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
-        exc = genai_errors.APITimeoutError(request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        # A hung client.chat.completions.create() call must never hang the
+        # caller. Mocking a raised APITimeoutError (rather than actually
+        # sleeping) proves the except clause routes to its own distinct
+        # reason -- if this test itself takes anywhere near
+        # GROQ_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
+        exc = groq.APITimeoutError(request=httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions"
         ))
-        assert isinstance(exc, genai_errors.APIError)
-        assert not isinstance(exc, genai_errors.APIStatusError)
+        assert isinstance(exc, groq.APIError)
+        assert not isinstance(exc, groq.APIStatusError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, history, gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, history, groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
-        assert "Gemini API request timed out" in result
+        assert "Groq API request timed out" in result
         assert "rate limit" not in result
-        assert "invalid Gemini API key" not in result
-        assert result.count("Gemini API error") == 0
+        assert "invalid Groq API key" not in result
+        assert result.count("Groq API error") == 0
         assert history == []  # failed turn not recorded
 
     def test_connection_error_is_caught_by_the_broad_apierror_base_class(self, context_text):
         # APIConnectionError has no HTTP response/status_code (network-level
         # failure) -- NOT an APIStatusError subclass, so this specifically
-        # exercises the broader `except genai_errors.APIError` branch, mirroring
-        # tests/test_digest_engine.py's equivalent test exactly.
-        exc = genai_errors.APIConnectionError(message="connection failed", request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        # exercises the broader `except groq.APIConnectionError` branch,
+        # mirroring tests/test_digest_engine.py's equivalent test exactly.
+        exc = groq.APIConnectionError(message="connection failed", request=httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions"
         ))
-        assert isinstance(exc, genai_errors.APIError)
-        assert not isinstance(exc, genai_errors.APIStatusError)
+        assert isinstance(exc, groq.APIError)
+        assert not isinstance(exc, groq.APIStatusError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, [], groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
-        assert "Gemini API error" in result
+        assert "could not reach the Groq API" in result
         assert "unexpected error" not in result
 
     def test_generic_exception_falls_back_instead_of_raising(self, context_text):
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = RuntimeError("boom")
+        mock_client.with_options.return_value.chat.completions.create.side_effect = RuntimeError("boom")
 
         history = []
-        with patch("src.chat_engine.genai.Client", return_value=mock_client):
-            result = answer_account_question("A question?", context_text, history, gemini_api_key="fake-gemini-key")
+        with patch("src.chat_engine.groq.Groq", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, history, groq_api_key="fake-groq-key")
 
         assert "temporarily unavailable" in result
         assert "unexpected error" in result
@@ -513,17 +512,6 @@ class TestSuccessfulAnthropicCall:
             {"role": "user", "content": "Second question?"},
         ]
 
-    def test_gemini_bookkeeping_key_is_stripped_from_anthropic_messages(self, context_text):
-        # If a conversation started on Gemini and then fell back to Anthropic
-        # mid-session, history turns may carry a gemini_interaction_id key --
-        # Anthropic's messages list must never see it.
-        history_with_gemini_key = [
-            {"role": "user", "content": "q1"},
-            {"role": "assistant", "content": "a1", "gemini_interaction_id": "some-id"},
-        ]
-        messages = _anthropic_messages_from_history(history_with_gemini_key)
-        assert messages == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
-
     def test_empty_model_response_falls_back(self, context_text):
         mock_client = MagicMock()
         mock_client.with_options.return_value.messages.create.return_value = self._mock_response(text="   ")
@@ -577,18 +565,19 @@ class TestAnthropicFailuresDegradeGracefully:
 
 
 class TestTargetConfiguration:
-    def test_gemini_only_configuration_calls_gemini_not_anthropic(self, context_text):
-        mock_interaction = types.SimpleNamespace(output_text="Gemini-generated answer.", id="interaction-x")
-        mock_gemini_client = MagicMock()
-        mock_gemini_client.interactions.create.return_value = mock_interaction
+    def test_groq_only_configuration_calls_groq_not_anthropic(self, context_text):
+        mock_groq_client = MagicMock()
+        mock_groq_client.with_options.return_value.chat.completions.create.return_value = _mock_groq_response(
+            "Groq-generated answer."
+        )
 
-        with patch("src.chat_engine.genai.Client", return_value=mock_gemini_client) as mock_genai_cls, \
+        with patch("src.chat_engine.groq.Groq", return_value=mock_groq_client) as mock_groq_cls, \
              patch("src.chat_engine.anthropic.Anthropic") as mock_anthropic_cls:
             result = answer_account_question(
                 "A question?", context_text, [],
-                anthropic_api_key=None, gemini_api_key="fake-gemini-key",
+                anthropic_api_key=None, groq_api_key="fake-groq-key",
             )
 
-        assert result == "Gemini-generated answer."
-        mock_genai_cls.assert_called_once()
+        assert result == "Groq-generated answer."
+        mock_groq_cls.assert_called_once()
         mock_anthropic_cls.assert_not_called()

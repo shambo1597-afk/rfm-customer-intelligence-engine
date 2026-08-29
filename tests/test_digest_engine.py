@@ -2,7 +2,7 @@
 tests/test_digest_engine.py - pytest suite for the optional AI Executive Summary.
 
 No real network calls are made anywhere in this file -- both provider clients
-(Anthropic, Gemini) are always mocked (unittest.mock) when a "successful call" or
+(Anthropic, Groq) are always mocked (unittest.mock) when a "successful call" or
 "provider failure" path is exercised, and the no-key fallback path is tested
 precisely because it must NOT construct a client or attempt any network call at all.
 """
@@ -10,28 +10,28 @@ precisely because it must NOT construct a client or attempt any network call at 
 import types
 from unittest.mock import MagicMock, patch
 
+import groq
 import httpx
 import pytest
-from google.genai._gaos.lib import compat_errors as genai_errors
 
 from src.rfm_engine import get_segment_kpi_summary
 from src.digest_engine import (
     generate_account_digest,
     get_anthropic_api_key,
-    get_gemini_api_key,
+    get_groq_api_key,
     get_digest_provider_override,
     _resolve_provider,
     _build_aggregate_stats,
     _build_prompt,
     _fallback_digest,
-    _call_gemini,
+    _call_groq,
     _call_anthropic,
     MODEL_ID,
     MAX_TOKENS,
     REQUEST_TIMEOUT_SECONDS,
-    GEMINI_MODEL_ID,
-    GEMINI_MAX_OUTPUT_TOKENS,
-    GEMINI_REQUEST_TIMEOUT_SECONDS,
+    GROQ_MODEL_ID,
+    GROQ_MAX_OUTPUT_TOKENS,
+    GROQ_REQUEST_TIMEOUT_SECONDS,
 )
 
 
@@ -40,32 +40,22 @@ def segment_summary(clv_df):
     return get_segment_kpi_summary(clv_df)
 
 
-def _make_gemini_api_error(status_code: int, message: str, reason: str = "", body: dict = None):
+def _make_groq_api_error(status_code: int, message: str = "error"):
     """
-    Builds a real `genai_errors.APIStatusError` subclass instance via the exact
-    factory (`APIError.generate`) the installed google-genai SDK itself uses to
-    turn an HTTP response into an exception -- rather than hand-picking a
-    subclass in the test, this reproduces the SDK's real status_code -> class
-    dispatch (confirmed by direct reproduction against a live invalid-key call;
-    see src/digest_engine.py's module docstring), so these tests exercise the
-    actual exception hierarchy `client.interactions.create()` raises, not a
-    guess at it.
-
-    `body` defaults to a simple `{code, message, status}` error envelope; pass
-    it explicitly to reproduce a more specific real response shape (e.g. the
-    invalid-key error's nested `details` list -- see
-    test_invalid_api_key_returns_400_bad_request_and_still_falls_back_with_invalid_key_reason).
+    Builds a real groq exception instance for the given HTTP status code via
+    the REAL groq.Groq client's own `_make_status_error()` dispatch method --
+    confirmed via direct introspection of the pinned groq package
+    (groq/_client.py) to be the exact method the SDK itself calls internally
+    to translate an HTTP response into an exception. Unlike google-genai's
+    SDK (this project's former Gemini provider), groq has no standalone
+    `APIError.generate()` factory -- this reaches the real dispatch logic
+    through a throwaway client instance instead of reimplementing the
+    status_code -> class mapping as a guess.
     """
-    request = httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/interactions")
+    request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
     response = httpx.Response(status_code=status_code, request=request)
-    if body is None:
-        body = {"error": {"code": status_code, "message": message, "status": reason}}
-    return genai_errors.APIError.generate(
-        status_code=status_code,
-        body=body,
-        message=f"Error code: {status_code} - [{body}]",
-        response=response,
-    )
+    client = groq.Groq(api_key="dummy-key-for-error-construction")
+    return client._make_status_error(message, body=None, response=response)
 
 
 class TestNamedConstants:
@@ -80,46 +70,49 @@ class TestNamedConstants:
         # on the cheap model -- a regression here silently breaks the ~$1/mo claim.
         assert "haiku" in MODEL_ID.lower()
 
-    def test_gemini_model_and_max_output_tokens_are_module_level_constants(self):
-        assert isinstance(GEMINI_MODEL_ID, str) and GEMINI_MODEL_ID
-        assert isinstance(GEMINI_MAX_OUTPUT_TOKENS, int) and GEMINI_MAX_OUTPUT_TOKENS > 0
+    def test_groq_model_and_max_output_tokens_are_module_level_constants(self):
+        assert isinstance(GROQ_MODEL_ID, str) and GROQ_MODEL_ID
+        assert isinstance(GROQ_MAX_OUTPUT_TOKENS, int) and GROQ_MAX_OUTPUT_TOKENS > 0
 
-    def test_gemini_model_is_the_free_tier_flash_lite_not_pro(self):
-        # Pro models require billing and are not on the free tier -- a regression
-        # here silently breaks the "genuinely $0 by default" claim.
-        model_lower = GEMINI_MODEL_ID.lower()
-        assert "flash-lite" in model_lower
-        assert "pro" not in model_lower
+    def test_groq_model_is_not_the_confirmed_deprecated_llama_3_3_70b_versatile(self):
+        # Regression guard for the exact mistake this codebase already made once
+        # with Gemini (a pinned model name going stale under it): the task that
+        # introduced Groq support specified "llama-3.3-70b-versatile", which
+        # live verification (see digest_engine.py's module docstring
+        # "Model-choice note") found Groq had deprecated -- "no longer being
+        # served by August 2026" on the free/developer tier this project uses.
+        # GROQ_MODEL_ID must never silently revert to it.
+        assert GROQ_MODEL_ID != "llama-3.3-70b-versatile"
 
-    def test_gemini_request_timeout_seconds_is_a_positive_module_level_constant(self):
-        # Per-call timeout fix for googleapis/python-genai#1893/#911 -- see
-        # module docstring's "Request-hangs-indefinitely note". Must be a real,
-        # finite, positive number of seconds, not left unset/None/0 (which would
-        # silently reopen the hang).
-        assert isinstance(GEMINI_REQUEST_TIMEOUT_SECONDS, (int, float))
-        assert GEMINI_REQUEST_TIMEOUT_SECONDS > 0
+    def test_groq_request_timeout_seconds_is_a_positive_module_level_constant(self):
+        # Outer safety-net timeout, mirroring this codebase's own Gemini-hang
+        # lesson (see module docstring) even though Groq's client already
+        # retries sensibly on its own. Must be a real, finite, positive number
+        # of seconds, not left unset/None/0.
+        assert isinstance(GROQ_REQUEST_TIMEOUT_SECONDS, (int, float))
+        assert GROQ_REQUEST_TIMEOUT_SECONDS > 0
 
 
 class TestResolveProvider:
     """
     Every branch _resolve_provider() must handle, per the task spec: both keys with
-    no override -> gemini; both keys with an override -> that provider; only one key
+    no override -> groq; both keys with an override -> that provider; only one key
     present -> that provider regardless of override; neither key -> "none"; an
     override naming a provider whose key is absent -> falls back to whichever key
     IS present, or "none".
     """
 
-    def test_both_keys_no_override_prefers_gemini(self):
-        assert _resolve_provider("a-key", "g-key") == "gemini"
+    def test_both_keys_no_override_prefers_groq(self):
+        assert _resolve_provider("a-key", "g-key") == "groq"
 
     def test_both_keys_override_anthropic_uses_anthropic(self):
         assert _resolve_provider("a-key", "g-key", override="anthropic") == "anthropic"
 
-    def test_both_keys_override_gemini_uses_gemini(self):
-        assert _resolve_provider("a-key", "g-key", override="gemini") == "gemini"
+    def test_both_keys_override_groq_uses_groq(self):
+        assert _resolve_provider("a-key", "g-key", override="groq") == "groq"
 
-    def test_only_gemini_key_uses_gemini(self):
-        assert _resolve_provider(None, "g-key") == "gemini"
+    def test_only_groq_key_uses_groq(self):
+        assert _resolve_provider(None, "g-key") == "groq"
 
     def test_only_anthropic_key_uses_anthropic(self):
         assert _resolve_provider("a-key", None) == "anthropic"
@@ -128,39 +121,39 @@ class TestResolveProvider:
         assert _resolve_provider(None, None) == "none"
 
     def test_override_naming_a_provider_with_no_key_falls_back_to_present_key(self):
-        # override="gemini" but no Gemini key -- falls back to Anthropic, which IS present.
-        assert _resolve_provider("a-key", None, override="gemini") == "anthropic"
-        # override="anthropic" but no Anthropic key -- falls back to Gemini, which IS present.
-        assert _resolve_provider(None, "g-key", override="anthropic") == "gemini"
+        # override="groq" but no Groq key -- falls back to Anthropic, which IS present.
+        assert _resolve_provider("a-key", None, override="groq") == "anthropic"
+        # override="anthropic" but no Anthropic key -- falls back to Groq, which IS present.
+        assert _resolve_provider(None, "g-key", override="anthropic") == "groq"
 
     def test_override_naming_a_provider_with_no_key_and_no_fallback_key_returns_none(self):
-        assert _resolve_provider(None, None, override="gemini") == "none"
+        assert _resolve_provider(None, None, override="groq") == "none"
         assert _resolve_provider(None, None, override="anthropic") == "none"
 
     def test_unrecognized_override_value_is_ignored(self):
         # A typo'd/garbage override falls through to the normal preference order,
         # never raises.
-        assert _resolve_provider("a-key", "g-key", override="chatgpt") == "gemini"
+        assert _resolve_provider("a-key", "g-key", override="chatgpt") == "groq"
         assert _resolve_provider(None, None, override="chatgpt") == "none"
 
 
 class TestFallbackPathNoKeys:
     def test_no_keys_returns_fallback_without_any_network_call(self, rfmt_df, clv_df, segment_summary):
         with patch("src.digest_engine.anthropic.Anthropic") as mock_anthropic_cls, \
-             patch("src.digest_engine.genai.Client") as mock_genai_cls:
+             patch("src.digest_engine.groq.Groq") as mock_groq_cls:
             result = generate_account_digest(rfmt_df, clv_df, segment_summary)
             mock_anthropic_cls.assert_not_called()
-            mock_genai_cls.assert_not_called()
+            mock_groq_cls.assert_not_called()
 
         assert isinstance(result, str) and result
         assert "[Template Summary" in result
 
     def test_empty_string_keys_also_fall_back(self, rfmt_df, clv_df, segment_summary):
         with patch("src.digest_engine.anthropic.Anthropic") as mock_anthropic_cls, \
-             patch("src.digest_engine.genai.Client") as mock_genai_cls:
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, anthropic_api_key="", gemini_api_key="")
+             patch("src.digest_engine.groq.Groq") as mock_groq_cls:
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, anthropic_api_key="", groq_api_key="")
             mock_anthropic_cls.assert_not_called()
-            mock_genai_cls.assert_not_called()
+            mock_groq_cls.assert_not_called()
         assert "[Template Summary" in result
 
     def test_fallback_is_deterministic_for_the_same_stats(self, rfmt_df, clv_df, segment_summary):
@@ -204,19 +197,21 @@ class TestPromptContainsOnlyAggregateData:
         # top_segments is capped/aggregate (segment-level), never one entry per customer.
         assert len(stats["top_segments"]) <= 3
 
-    def test_prompt_built_for_the_gemini_path_also_excludes_raw_customer_ids(self, rfmt_df, clv_df, segment_summary):
+    def test_prompt_built_for_the_groq_path_also_excludes_raw_customer_ids(self, rfmt_df, clv_df, segment_summary):
         # generate_account_digest() calls the same _build_prompt() regardless of
-        # provider -- re-run the PII-exclusion check end-to-end through the Gemini
+        # provider -- re-run the PII-exclusion check end-to-end through the Groq
         # branch specifically, not just against _build_prompt() in isolation.
-        mock_interaction = types.SimpleNamespace(output_text="A summary with no customer IDs.")
+        mock_response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="A summary with no customer IDs."))]
+        )
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = mock_response
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        sent_prompt = kwargs["input"]
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        sent_prompt = kwargs["messages"][0]["content"]
         for customer_id in rfmt_df["CustomerID"].astype(str):
             assert customer_id not in sent_prompt
 
@@ -300,478 +295,326 @@ class TestAnthropicFailuresDegradeGracefully:
         assert expected_reason_snippet in result
 
 
-class TestSuccessfulGeminiCall:
-    def test_successful_call_returns_model_text_not_fallback(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text="A healthy account overall.")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+class TestSuccessfulGroqCall:
+    def _mock_response(self, text="A healthy account overall."):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+        )
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client) as mock_client_cls:
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+    def test_successful_call_returns_model_text_not_fallback(self, rfmt_df, clv_df, segment_summary):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response()
+
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client) as mock_client_cls:
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert result == "A healthy account overall."
         assert "[Template Summary" not in result
-        mock_client_cls.assert_called_once_with(api_key="fake-gemini-key")
+        mock_client_cls.assert_called_once_with(api_key="fake-groq-key")
 
-    def test_call_uses_the_named_model_and_max_output_tokens_constants(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text="Summary text.")
+    def test_call_uses_the_named_model_and_max_tokens_constants(self, rfmt_df, clv_df, segment_summary):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("Summary text.")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["model"] == GEMINI_MODEL_ID
-        assert kwargs["generation_config"]["max_output_tokens"] == GEMINI_MAX_OUTPUT_TOKENS
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        assert kwargs["model"] == GROQ_MODEL_ID
+        assert kwargs["max_tokens"] == GROQ_MAX_OUTPUT_TOKENS
 
-    def test_call_passes_the_per_call_timeout_kwarg_not_client_level_http_options(
-        self, rfmt_df, clv_df, segment_summary
-    ):
-        # Fix for googleapis/python-genai#1893/#911: the timeout MUST be the
-        # per-call `timeout=` kwarg on interactions.create() itself, confirmed
-        # working -- NOT genai.Client(http_options=...), confirmed broken/
-        # unreliable by the SDK maintainers per #911. This asserts the actual
-        # call site, not just that the constant exists.
-        mock_interaction = types.SimpleNamespace(output_text="Summary text.")
+    def test_call_passes_the_timeout_via_with_options_not_a_per_call_kwarg(self, rfmt_df, clv_df, segment_summary):
+        # Mirrors Anthropic's own with_options(timeout=...) mechanism exactly
+        # (both SDKs support it) -- NOT Gemini's old per-call `timeout=` kwarg
+        # pattern, which doesn't apply here. Asserts the actual call site.
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("Summary text.")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client) as mock_client_cls:
-            generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
-        # genai.Client() itself must only ever be constructed with api_key --
-        # never an http_options timeout, which would be the broken pattern.
-        _, client_kwargs = mock_client_cls.call_args
-        assert "http_options" not in client_kwargs
+        mock_client.with_options.assert_called_once_with(timeout=GROQ_REQUEST_TIMEOUT_SECONDS)
 
-    def test_prompt_is_passed_as_the_input_parameter(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text="Summary text.")
+    def test_prompt_is_passed_via_the_messages_parameter(self, rfmt_df, clv_df, segment_summary):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("Summary text.")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["input"] == _build_prompt(_build_aggregate_stats(rfmt_df, clv_df, segment_summary))
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        expected_prompt = _build_prompt(_build_aggregate_stats(rfmt_df, clv_df, segment_summary))
+        assert kwargs["messages"] == [{"role": "user", "content": expected_prompt}]
 
     def test_empty_output_text_falls_back(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text="   ")
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("   ")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "empty response from Gemini" in result
+        assert "empty response from Groq" in result
 
     def test_missing_output_text_falls_back(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text=None)
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response(None)
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
 
 
-class TestGeminiFailuresDegradeGracefully:
+class TestGroqFailuresDegradeGracefully:
     def test_missing_key_falls_back_without_any_network_call(self, rfmt_df, clv_df, segment_summary):
-        with patch("src.digest_engine.genai.Client") as mock_client_cls:
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key=None)
+        with patch("src.digest_engine.groq.Groq") as mock_client_cls:
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key=None)
             mock_client_cls.assert_not_called()
         assert "[Template Summary" in result
 
-    def test_genai_package_missing_falls_back(self, rfmt_df, clv_df, segment_summary):
-        with patch("src.digest_engine.genai", None):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+    def test_groq_package_missing_falls_back(self, rfmt_df, clv_df, segment_summary):
+        with patch("src.digest_engine.groq", None):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
         assert "[Template Summary" in result
         assert "not installed" in result
 
-    def test_rate_limit_429_resource_exhausted_falls_back_with_specific_reason(self, rfmt_df, clv_df, segment_summary):
-        # This is the documented, expected-at-scale free-tier ceiling
-        # (ai.google.dev/gemini-api/docs/rate-limits) -- must be caught, not raised.
-        exc = _make_gemini_api_error(429, "quota exceeded", reason="RESOURCE_EXHAUSTED")
-        assert isinstance(exc, genai_errors.RateLimitError)  # sanity check on the helper itself
+    def test_rate_limit_falls_back_with_specific_reason(self, rfmt_df, clv_df, segment_summary):
+        # This is the documented, expected-at-scale free-tier ceiling (see
+        # digest_engine.py's module docstring for the current rate-limit
+        # numbers and their sourcing caveat) -- must be caught, not raised.
+        exc = _make_groq_api_error(429, "quota exceeded")
+        assert isinstance(exc, groq.RateLimitError)  # sanity check on the helper itself
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "Gemini free-tier rate limit reached" in result
+        assert "Groq free-tier rate limit reached" in result
 
-    def test_invalid_api_key_returns_400_bad_request_and_still_falls_back_with_invalid_key_reason(
-        self, rfmt_df, clv_df, segment_summary
-    ):
-        # This is the REAL shape Google's API returns for a bad key (confirmed by
-        # reproducing a live invalid-key call against the pinned SDK version) --
-        # HTTP 400 BadRequestError, with the outer body 'status' as
-        # 'INVALID_ARGUMENT' (NOT a distinguishing signal on its own -- many
-        # non-key 400s share it) and the specific 'API_KEY_INVALID' reason
-        # nested in 'details', exactly as Google's real response embeds it. NOT
-        # 401/403 as HTTP convention might suggest. This is the exact real-world
-        # response shape the bug this fix addresses was silently mis-handling.
-        real_invalid_key_body = {
-            "error": {
-                "code": 400,
-                "message": "API key not valid. Please pass a valid API key.",
-                "status": "INVALID_ARGUMENT",
-                "details": [
-                    {
-                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                        "reason": "API_KEY_INVALID",
-                        "domain": "googleapis.com",
-                        "metadata": {"service": "generativelanguage.googleapis.com"},
-                    },
-                ],
-            }
-        }
-        exc = _make_gemini_api_error(
-            400, "API key not valid. Please pass a valid API key.", body=real_invalid_key_body
-        )
-        assert isinstance(exc, genai_errors.BadRequestError)  # sanity check on the helper itself
+    def test_invalid_api_key_falls_back_with_specific_reason(self, rfmt_df, clv_df, segment_summary):
+        # Unlike Gemini's non-standard "400 with API_KEY_INVALID in the body"
+        # quirk, Groq/OpenAI-compatible APIs use standard HTTP 401 for bad
+        # credentials -- confirmed via the pinned SDK's own status_code -> class
+        # dispatch (groq/_client.py's _make_status_error()), no body-content
+        # sniffing required.
+        exc = _make_groq_api_error(401, "bad credentials")
+        assert isinstance(exc, groq.AuthenticationError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="bad-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="bad-key")
 
         assert "[Template Summary" in result
-        assert "invalid Gemini API key" in result
+        assert "invalid Groq API key" in result
         assert "unexpected error" not in result
 
-    @pytest.mark.parametrize("code", [401, 403])
-    def test_auth_errors_fall_back_with_invalid_key_reason(self, rfmt_df, clv_df, segment_summary, code):
-        exc = _make_gemini_api_error(code, "bad credentials", reason="UNAUTHENTICATED")
+    def test_other_status_error_falls_back_with_generic_reason(self, rfmt_df, clv_df, segment_summary):
+        # A non-2xx that isn't one of the specifically-distinguished classes
+        # above should get the generic reason, not be mistaken for a bad key
+        # or a rate limit.
+        exc = _make_groq_api_error(404, "not found")
+        assert isinstance(exc, groq.NotFoundError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="bad-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "invalid Gemini API key" in result
+        assert "Groq API error" in result
+        assert "invalid Groq API key" not in result
 
-    def test_other_bad_request_error_falls_back_with_generic_reason(self, rfmt_df, clv_df, segment_summary):
-        # A 400 that is NOT the invalid-key shape (no 'API_KEY_INVALID' in the
-        # message) should get the generic reason, not be mistaken for a bad key.
-        exc = _make_gemini_api_error(400, "malformed generation_config", reason="INVALID_ARGUMENT")
+    def test_server_error_falls_back_via_the_status_error_branch(self, rfmt_df, clv_df, segment_summary):
+        exc = _make_groq_api_error(500, "internal error")
+        assert isinstance(exc, groq.InternalServerError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "Gemini API error" in result
-        assert "invalid Gemini API key" not in result
-
-    def test_server_error_falls_back_via_the_broad_apierror_base_class(self, rfmt_df, clv_df, segment_summary):
-        # InternalServerError is an APIStatusError subclass (still has
-        # status_code) -- goes through the same branch as the other status
-        # errors above and lands on the generic reason (no dedicated 5xx message).
-        exc = _make_gemini_api_error(500, "internal error")
-        assert isinstance(exc, genai_errors.InternalServerError)
-        mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
-
-        assert "[Template Summary" in result
-        assert "Gemini API error" in result
+        assert "Groq API error" in result
 
     def test_timeout_falls_back_with_its_own_distinct_reason_never_hangs_the_test(
         self, rfmt_df, clv_df, segment_summary
     ):
-        # The actual bug this fix addresses: a hung client.interactions.create()
-        # call must never hang the caller. Mocking a raised APITimeoutError
-        # (rather than actually sleeping) proves the except clause routes to its
-        # own distinct reason -- if this test itself takes anywhere near
-        # GEMINI_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
-        exc = genai_errors.APITimeoutError(request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        # A hung client.chat.completions.create() call must never hang the
+        # caller. Mocking a raised APITimeoutError (rather than actually
+        # sleeping) proves the except clause routes to its own distinct
+        # reason -- if this test itself takes anywhere near
+        # GROQ_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
+        exc = groq.APITimeoutError(request=httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions"
         ))
-        assert isinstance(exc, genai_errors.APIError)
-        assert not isinstance(exc, genai_errors.APIStatusError)
+        assert isinstance(exc, groq.APIError)
+        assert not isinstance(exc, groq.APIStatusError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "Gemini API request timed out" in result
-        # Must never be conflated with the other Gemini failure reasons.
+        assert "Groq API request timed out" in result
+        # Must never be conflated with the other Groq failure reasons.
         assert "rate limit" not in result
-        assert "invalid Gemini API key" not in result
-        assert result.count("Gemini API error") == 0
+        assert "invalid Groq API key" not in result
+        assert result.count("Groq API error") == 0
 
     def test_connection_error_is_caught_by_the_broad_apierror_base_class(self, rfmt_df, clv_df, segment_summary):
-        # APIConnectionError has no HTTP response/status_code at all (it's raised
-        # for network-level failures) -- it is NOT an APIStatusError subclass, so
-        # this specifically exercises the broader `except genai_errors.APIError`
-        # branch, confirming a future/less-common error variant still gets a
-        # diagnostic reason instead of silently falling through to the generic
-        # catch-all (the exact failure mode this fix addresses).
-        exc = genai_errors.APIConnectionError(message="connection failed", request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        # APIConnectionError has no HTTP response/status_code at all (raised
+        # for network-level failures) -- it is NOT an APIStatusError subclass,
+        # so this exercises the broader `except groq.APIConnectionError`
+        # branch specifically (distinct from the APIStatusError branch above).
+        exc = groq.APIConnectionError(message="connection failed", request=httpx.Request(
+            "POST", "https://api.groq.com/openai/v1/chat/completions"
         ))
-        assert isinstance(exc, genai_errors.APIError)
-        assert not isinstance(exc, genai_errors.APIStatusError)
+        assert isinstance(exc, groq.APIError)
+        assert not isinstance(exc, groq.APIStatusError)
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
-        assert "Gemini API error" in result
+        assert "could not reach the Groq API" in result
         assert "unexpected error" not in result
 
     def test_generic_exception_falls_back_instead_of_raising(self, rfmt_df, clv_df, segment_summary):
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = RuntimeError("boom")
+        mock_client.with_options.return_value.chat.completions.create.side_effect = RuntimeError("boom")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, groq_api_key="fake-groq-key")
 
         assert "[Template Summary" in result
         assert "unexpected error" in result
 
 
-class TestCallGeminiInIsolation:
+class TestCallGroqInIsolation:
     """
-    Direct, isolated coverage of _call_gemini() -- the shared Gemini call/
-    error-handling logic extracted (Issue 2, the deduplication hardening
-    pass) so it has its own test coverage rather than only being exercised
-    indirectly through generate_account_digest() and
-    src/chat_engine.py's answer_account_question(). Every test here calls
-    _call_gemini() directly and asserts on its (text, interaction_id,
-    failure_reason) return tuple -- no _fallback_digest()/_chat_unavailable()
-    wrapping involved, since that's each caller's own concern, not this
-    function's.
+    Direct, isolated coverage of _call_groq() -- the shared Groq call/
+    error-handling logic (mirrors _call_anthropic() almost line for line, see
+    its docstring in src/digest_engine.py) so it has its own test coverage
+    rather than only being exercised indirectly through generate_account_digest()
+    and src/chat_engine.py's answer_account_question(). Every test here calls
+    _call_groq() directly and asserts on its (text, failure_reason) return
+    tuple -- no _fallback_digest()/_chat_unavailable() wrapping involved,
+    since that's each caller's own concern, not this function's.
     """
 
-    def test_success_returns_text_interaction_id_and_no_failure_reason(self):
-        mock_interaction = types.SimpleNamespace(output_text="A generated answer.", id="interaction-abc")
+    def _mock_response(self, text="A generated answer."):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+        )
+
+    def test_success_returns_text_and_no_failure_reason(self):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response()
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="fake-groq-key",
+                max_tokens=300,
             )
 
         assert text == "A generated answer."
-        assert interaction_id == "interaction-abc"
         assert failure_reason is None
 
-    def test_success_when_response_has_no_id_attribute_returns_none_id_not_a_crash(self):
-        # digest_engine.py's own existing Gemini-success tests mock
-        # types.SimpleNamespace(output_text=...) with NO `id` field -- this
-        # confirms _call_gemini() tolerates that (getattr with a default)
-        # rather than raising AttributeError, which is what a naive
-        # `interaction.id` would have done.
-        mock_interaction = types.SimpleNamespace(output_text="An answer.")
+    def test_messages_model_max_tokens_and_timeout_are_passed_through(self):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response()
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}]
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
-            )
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            _call_groq(messages=messages, api_key="fake-groq-key", max_tokens=123)
 
-        assert text == "An answer."
-        assert interaction_id is None
-        assert failure_reason is None
+        mock_client.with_options.assert_called_once_with(timeout=GROQ_REQUEST_TIMEOUT_SECONDS)
+        _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
+        assert kwargs["model"] == GROQ_MODEL_ID
+        assert kwargs["max_tokens"] == 123
+        assert kwargs["messages"] == messages
 
-    def test_system_instruction_none_omits_the_kwarg_entirely(self):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
+    def test_empty_response_returns_the_documented_failure_reason(self):
         mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("   ")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            _call_gemini("a prompt", None, "fake-gemini-key", 300)
-
-        _, kwargs = mock_client.interactions.create.call_args
-        assert "system_instruction" not in kwargs
-
-    def test_system_instruction_when_given_is_passed_through(self):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            _call_gemini("a question", "a system prompt", "fake-gemini-key", 300)
-
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["system_instruction"] == "a system prompt"
-
-    def test_previous_interaction_id_none_omits_the_kwarg_entirely(self):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            _call_gemini("a prompt", None, "fake-gemini-key", 300, previous_interaction_id=None)
-
-        _, kwargs = mock_client.interactions.create.call_args
-        assert "previous_interaction_id" not in kwargs
-
-    def test_previous_interaction_id_when_given_is_passed_through(self):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i2")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            _call_gemini("a prompt", None, "fake-gemini-key", 300, previous_interaction_id="prior-id")
-
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["previous_interaction_id"] == "prior-id"
-
-    def test_max_output_tokens_and_timeout_are_always_passed_through(self):
-        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i3")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            _call_gemini("a prompt", None, "fake-gemini-key", 123)
-
-        _, kwargs = mock_client.interactions.create.call_args
-        assert kwargs["generation_config"]["max_output_tokens"] == 123
-        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
-
-    def test_empty_output_text_returns_the_documented_failure_reason(self):
-        mock_interaction = types.SimpleNamespace(output_text="   ", id="i4")
-        mock_client = MagicMock()
-        mock_client.interactions.create.return_value = mock_interaction
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
             )
 
         assert text is None
-        assert interaction_id is None
-        assert failure_reason == "empty response from Gemini"
+        assert failure_reason == "empty response from Groq"
 
     def test_package_missing_returns_the_documented_failure_reason(self):
-        # Patches src.digest_engine.genai directly (the name _call_gemini()
-        # itself reads) -- see _call_gemini()'s own docstring for why this
-        # check can't be caller-agnostic across modules.
-        with patch("src.digest_engine.genai", None):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
+        # Patches src.digest_engine.groq directly (the name _call_groq()
+        # itself reads) -- see its docstring for why this check can't be
+        # caller-agnostic across modules.
+        with patch("src.digest_engine.groq", None):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
             )
 
         assert text is None
-        assert interaction_id is None
-        assert failure_reason == "google-genai package not installed"
+        assert failure_reason == "groq package not installed"
 
-    def test_rate_limit_returns_the_documented_failure_reason(self):
-        exc = _make_gemini_api_error(429, "quota exceeded", reason="RESOURCE_EXHAUSTED")
+    @pytest.mark.parametrize("exception_name,expected_reason", [
+        ("AuthenticationError", "invalid Groq API key"),
+        ("RateLimitError", "Groq free-tier rate limit reached"),
+        ("APIStatusError", "Groq API error"),
+        ("APIConnectionError", "could not reach the Groq API"),
+        ("APITimeoutError", "Groq API request timed out"),
+    ])
+    def test_each_typed_exception_returns_its_own_documented_failure_reason(
+        self, exception_name, expected_reason
+    ):
+        exc_cls = getattr(groq, exception_name)
+        # Bare object.__new__ bypass -- these classes' real __init__ signatures
+        # vary (some need response/body, APIConnectionError needs request), but
+        # `except` only matches on type, so a real instance of the correct
+        # class (however constructed) is all that's needed here. Same pattern
+        # already used for anthropic's exceptions above.
+        exc_instance = exc_cls.__new__(exc_cls)
+
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
+        mock_client.with_options.return_value.chat.completions.create.side_effect = exc_instance
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
             )
 
-        assert text is None and interaction_id is None
-        assert failure_reason == "Gemini free-tier rate limit reached"
-
-    @pytest.mark.parametrize("status_code", [400, 401, 403])
-    def test_invalid_key_shapes_return_the_documented_failure_reason(self, status_code):
-        exc = _make_gemini_api_error(
-            status_code, "bad credentials",
-            reason="UNAUTHENTICATED" if status_code != 400 else "INVALID_ARGUMENT",
-            body={"error": {"code": status_code, "message": "API key not valid.",
-                             "details": [{"reason": "API_KEY_INVALID"}]}} if status_code == 400 else None,
-        )
-        mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
-            )
-
-        assert text is None and interaction_id is None
-        assert failure_reason == "invalid Gemini API key"
-
-    def test_other_api_status_error_returns_the_generic_failure_reason(self):
-        exc = _make_gemini_api_error(404, "not found")
-        mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
-            )
-
-        assert text is None and interaction_id is None
-        assert failure_reason == "Gemini API error"
-
-    def test_timeout_returns_its_own_distinct_failure_reason(self):
-        exc = genai_errors.APITimeoutError(request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
-        ))
-        mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
-            )
-
-        assert text is None and interaction_id is None
-        assert failure_reason == "Gemini API request timed out"
-
-    def test_generic_connection_error_falls_back_via_the_broad_apierror_branch(self):
-        exc = genai_errors.APIConnectionError(message="connection failed", request=httpx.Request(
-            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
-        ))
-        mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = exc
-
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
-            )
-
-        assert text is None and interaction_id is None
-        assert failure_reason == "Gemini API error"
+        assert text is None
+        assert failure_reason == expected_reason
 
     def test_unexpected_exception_returns_a_reason_containing_unexpected_error(self):
         mock_client = MagicMock()
-        mock_client.interactions.create.side_effect = RuntimeError("boom")
+        mock_client.with_options.return_value.chat.completions.create.side_effect = RuntimeError("boom")
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_client):
-            text, interaction_id, failure_reason = _call_gemini(
-                "a prompt", None, "fake-gemini-key", 300
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
             )
 
-        assert text is None and interaction_id is None
+        assert text is None
         assert "unexpected error" in failure_reason
-        assert "Gemini" in failure_reason
+        assert "Groq" in failure_reason
 
 
 class TestCallAnthropicInIsolation:
     """
     Direct, isolated coverage of _call_anthropic() -- the shared Anthropic
-    call/error-handling logic extracted alongside _call_gemini() above (same
-    Issue 2 deduplication rationale, see _call_anthropic()'s own docstring in
-    src/digest_engine.py). Every test here calls _call_anthropic() directly
-    and asserts on its (text, failure_reason) return tuple.
+    call/error-handling logic (see its docstring in src/digest_engine.py).
+    Every test here calls _call_anthropic() directly and asserts on its
+    (text, failure_reason) return tuple.
     """
 
     def _mock_response(self, text="A generated answer."):
@@ -896,27 +739,29 @@ class TestCallAnthropicInIsolation:
 
 class TestTargetConfiguration:
     """
-    The actual configuration this feature was built for: GEMINI_API_KEY set,
-    ANTHROPIC_API_KEY absent. Confirms the Gemini branch is what actually executes,
+    The actual configuration this feature was built for: GROQ_API_KEY set,
+    ANTHROPIC_API_KEY absent. Confirms the Groq branch is what actually executes,
     end to end through generate_account_digest()'s provider resolution -- not just
     that _resolve_provider() returns the right string in isolation.
     """
 
-    def test_gemini_only_configuration_calls_gemini_not_anthropic(self, rfmt_df, clv_df, segment_summary):
-        mock_interaction = types.SimpleNamespace(output_text="Gemini-generated summary.")
-        mock_gemini_client = MagicMock()
-        mock_gemini_client.interactions.create.return_value = mock_interaction
+    def test_groq_only_configuration_calls_groq_not_anthropic(self, rfmt_df, clv_df, segment_summary):
+        mock_response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="Groq-generated summary."))]
+        )
+        mock_groq_client = MagicMock()
+        mock_groq_client.with_options.return_value.chat.completions.create.return_value = mock_response
 
-        with patch("src.digest_engine.genai.Client", return_value=mock_gemini_client) as mock_genai_cls, \
+        with patch("src.digest_engine.groq.Groq", return_value=mock_groq_client) as mock_groq_cls, \
              patch("src.digest_engine.anthropic.Anthropic") as mock_anthropic_cls:
             result = generate_account_digest(
                 rfmt_df, clv_df, segment_summary,
                 anthropic_api_key=None,
-                gemini_api_key="fake-gemini-key",
+                groq_api_key="fake-groq-key",
             )
 
-        assert result == "Gemini-generated summary."
-        mock_genai_cls.assert_called_once()
+        assert result == "Groq-generated summary."
+        mock_groq_cls.assert_called_once()
         mock_anthropic_cls.assert_not_called()
 
 
@@ -939,13 +784,13 @@ class TestApiKeyResolution:
         result = get_anthropic_api_key()
         assert result is None or isinstance(result, str)
 
-    def test_gemini_key_reads_from_environment_variable(self, monkeypatch):
-        monkeypatch.setenv("GEMINI_API_KEY", "gemini-env-key-456")
-        assert get_gemini_api_key() == "gemini-env-key-456"
+    def test_groq_key_reads_from_environment_variable(self, monkeypatch):
+        monkeypatch.setenv("GROQ_API_KEY", "groq-env-key-456")
+        assert get_groq_api_key() == "groq-env-key-456"
 
-    def test_gemini_key_returns_none_when_unset(self, monkeypatch):
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        result = get_gemini_api_key()
+    def test_groq_key_returns_none_when_unset(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        result = get_groq_api_key()
         assert result is None or isinstance(result, str)
 
     def test_provider_override_reads_from_environment_variable(self, monkeypatch):
@@ -953,13 +798,13 @@ class TestApiKeyResolution:
         assert get_digest_provider_override() == "anthropic"
 
     def test_provider_override_is_case_insensitive(self, monkeypatch):
-        monkeypatch.setenv("DIGEST_PROVIDER", "GEMINI")
-        assert get_digest_provider_override() == "gemini"
+        monkeypatch.setenv("DIGEST_PROVIDER", "GROQ")
+        assert get_digest_provider_override() == "groq"
 
     def test_provider_override_returns_none_when_unset(self, monkeypatch):
         monkeypatch.delenv("DIGEST_PROVIDER", raising=False)
         result = get_digest_provider_override()
-        assert result is None or result in ("gemini", "anthropic")
+        assert result is None or result in ("groq", "anthropic")
 
     def test_provider_override_returns_none_for_unrecognized_value(self, monkeypatch):
         monkeypatch.setenv("DIGEST_PROVIDER", "chatgpt")

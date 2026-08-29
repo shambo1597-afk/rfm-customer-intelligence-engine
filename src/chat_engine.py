@@ -33,28 +33,26 @@ difference in shape -- see the cost model section below.
 This module deliberately does NOT define its own provider-selection logic,
 model constants, provider-client construction, or exception-handling pattern
 -- it imports and reuses digest_engine.py's:
-  - _resolve_provider() for the Gemini-preferred-by-default / Anthropic-
+  - _resolve_provider() for the Groq-preferred-by-default / Anthropic-
     fallback decision (identical semantics to the digest feature).
-  - _call_gemini() / _call_anthropic() for the ENTIRE provider call: client
-    construction, the interactions.create()/messages.create() call shape, and
-    the full exception-handling chain for each provider -- not just the same
-    constants/exception classes reused in parallel, the literal same
-    function bodies. This was a real, confirmed maintainability risk before
-    this consolidation existed: generate_account_digest() (digest_engine.py)
-    and answer_account_question() (below) each independently re-implemented
-    nearly identical Gemini/Anthropic call logic, and it already caused
-    near-misses -- the model-ID fix and the request-timeout fix each had to
-    be hand-applied to both files separately, with real risk of the two
-    drifting out of sync. _call_gemini()/_call_anthropic() own ONLY the
-    provider call and its error classification (see their docstrings in
-    digest_engine.py for the exact (text, ..., failure_reason) return
-    shape) -- caller-specific bookkeeping (building the system prompt,
-    finding the prior Gemini interaction id to chain from, and mutating
+  - _call_groq() / _call_anthropic() for the ENTIRE provider call: client
+    construction, the chat.completions.create()/messages.create() call
+    shape, and the full exception-handling chain for each provider -- not
+    just the same constants/exception classes reused in parallel, the
+    literal same function bodies. This was a real, confirmed maintainability
+    risk before this consolidation existed: generate_account_digest()
+    (digest_engine.py) and answer_account_question() (below) each
+    independently re-implemented nearly identical provider call logic, and
+    it already caused near-misses -- fixes each had to be hand-applied to
+    both files separately, with real risk of the two drifting out of sync.
+    _call_groq()/_call_anthropic() own ONLY the provider call and its error
+    classification (see their docstrings in digest_engine.py for the exact
+    return shape) -- caller-specific bookkeeping (building the system
+    prompt, assembling `messages` from conversation_history, and mutating
     conversation_history) stays here in answer_account_question(), NOT in
-    the shared functions, since none of that is shared with the digest's
-    one-shot, non-conversational shape.
-  - GEMINI_MODEL_ID / MODEL_ID / GEMINI_REQUEST_TIMEOUT_SECONDS -- re-exported
-    here (imported but not directly called with -- _call_gemini()/
+    the shared functions.
+  - GROQ_MODEL_ID / MODEL_ID / GROQ_REQUEST_TIMEOUT_SECONDS -- re-exported
+    here (imported but not directly called with -- _call_groq()/
     _call_anthropic() already read digest_engine.py's own copies internally)
     purely so a future model or timeout swap in digest_engine.py is
     verifiably visible from this module's own namespace too, never re-guessed
@@ -64,29 +62,28 @@ model constants, provider-client construction, or exception-handling pattern
 --- Multi-turn conversation ---
 
 A real chat needs conversation context across turns, unlike the digest
-feature's one-shot call. The two providers' native multi-turn mechanisms are
-used as-is rather than building a third abstraction on top:
-  - Gemini: client.interactions.create()'s own stateful chaining via
-    previous_interaction_id -- confirmed via a real, live multi-turn call
-    (not assumed from docs) that passing the prior turn's `interaction.id` as
-    `previous_interaction_id` on the next call preserves conversational
-    context server-side, with NO need to resend prior turns' text. The system
-    instruction (the "answer only from the context blob" constraint) is
-    re-sent on EVERY turn regardless -- also confirmed live -- rather than
-    relying on it persisting through the chain, since that constraint is
-    safety-relevant and re-sending it costs only a short fixed string.
-  - Anthropic: the standard `messages` list of {"role", "content"} turns,
-    built from `conversation_history` and passed on every call (Anthropic's
-    Messages API has no server-side conversation state to chain against).
+feature's one-shot call. Both providers now use the SAME stateless pattern --
+a plain `messages` list of {"role", "content"} turns, resent in full on every
+call (neither Groq's nor Anthropic's chat API keeps server-side conversation
+state to chain against) -- so there is exactly one multi-turn mechanism here,
+not two. (This wasn't always true: Gemini, this project's original default
+provider before it was replaced with Groq, used a different, stateful
+`previous_interaction_id`-chaining mechanism that required its own
+bookkeeping key in every history entry. That asymmetry is gone along with
+Gemini -- see digest_engine.py's module docstring "Provider swap" note.)
 
-`conversation_history` is a list of turn dicts this function both READS (to
-reconstruct prior context) and MUTATES IN PLACE (appending this turn's
-question and answer before returning) -- the caller (app.py) passes the same
-list object across turns within a Streamlit session (st.session_state) rather
-than reassembling it. Each entry has at minimum {"role", "content"}; a
-Gemini-answered turn additionally carries {"gemini_interaction_id": <id>} so
-the NEXT call (regardless of which provider ends up resolved that time) can
-find the most recent Gemini interaction id to chain from, if any.
+`conversation_history` is a plain list of {"role", "content"} turn dicts this
+function both READS (to reconstruct prior context) and MUTATES IN PLACE
+(appending this turn's question and answer before returning) -- the caller
+(app.py) passes the same list object across turns within a Streamlit session
+(st.session_state) rather than reassembling it. For Anthropic, this list IS
+the `messages` payload (plus the new question appended), with the system
+prompt passed separately via Anthropic's own `system=` field. For Groq
+(OpenAI-compatible: no separate `system` field), a fresh {"role": "system",
+...} entry is prepended ahead of `conversation_history` on every call instead
+-- never stored back into conversation_history itself, so the stored history
+stays provider-agnostic and reusable regardless of which provider ends up
+resolved on any given turn (keys can change between turns).
 
 --- Cost model: usage-based, NOT the digest's fixed-per-batch-run bound ---
 
@@ -97,27 +94,28 @@ different shape from digest_engine.py's cost model, not a variant of it. The
 practical bound: a chat session used by one analyst reviewing one account in
 one sitting asks maybe 5-20 questions, each a small prompt (the context blob is
 kept compact -- see src/chat_context.py) against a short answer (capped by
-CHAT_MAX_OUTPUT_TOKENS below). At Gemini Flash-Lite-tier pricing (see
-digest_engine.py's module docstring for the current pricing-verification
-caveat -- the same caveat applies here, unchanged), that's still trivial token
-cost per sitting. But unlike the digest feature, there is no hard ceiling on
-how many questions a session can ask -- this module does NOT implement
-per-session budgeting/rate-limiting of its own; it relies on each provider's
-own account-level rate limits (the same 429/RESOURCE_EXHAUSTED handling
-digest_engine.py already has) as the practical backstop. This is a scope
-decision, not an oversight: per-session cost tracking was explicitly out of
-scope for this feature (see the task that introduced this module).
+CHAT_MAX_OUTPUT_TOKENS below). On Groq's free tier (see digest_engine.py's
+module docstring for the current rate-limit numbers and the caveat on how
+they were sourced -- the same caveat applies here, unchanged), that's still
+comfortably within the daily/per-minute ceilings for a single analyst's
+sitting. But unlike the digest feature, there is no hard ceiling on how many
+questions a session can ask -- this module does NOT implement per-session
+budgeting/rate-limiting of its own; it relies on each provider's own
+account-level rate limits (the same 429 handling digest_engine.py already
+has) as the practical backstop. This is a scope decision, not an oversight:
+per-session cost tracking was explicitly out of scope for this feature (see
+the task that introduced this module).
 """
 
 from src.digest_engine import (
     anthropic,
-    genai,
+    groq,
     _resolve_provider,
-    _call_gemini,
+    _call_groq,
     _call_anthropic,
     MODEL_ID,
-    GEMINI_MODEL_ID,
-    GEMINI_REQUEST_TIMEOUT_SECONDS,
+    GROQ_MODEL_ID,
+    GROQ_REQUEST_TIMEOUT_SECONDS,
 )
 
 # Chat answers get more room than the digest's 300-token cap (a single
@@ -244,33 +242,12 @@ def _chat_unavailable(reason: str) -> str:
     return f"{_UNAVAILABLE_PREFIX} — {reason}.]** Please try again, or contact support if this persists."
 
 
-def _last_gemini_interaction_id(conversation_history: list) -> str:
-    """Most recent turn's Gemini interaction id, if any, else None -- scans
-    backwards so a provider switch mid-conversation (e.g. Gemini's key was
-    removed and Anthropic took over) doesn't pick up a stale id from before
-    the switch was itself stale; None simply means "start a fresh Gemini
-    interaction chain," which is always a safe fallback."""
-    for turn in reversed(conversation_history):
-        interaction_id = turn.get("gemini_interaction_id")
-        if interaction_id:
-            return interaction_id
-    return None
-
-
-def _anthropic_messages_from_history(conversation_history: list) -> list:
-    """Anthropic's messages list needs only {"role", "content"} -- strips the
-    Gemini-specific bookkeeping key so a provider switch mid-conversation
-    (this account's key configuration can change between turns) never leaks a
-    Gemini-only field into an Anthropic call."""
-    return [{"role": turn["role"], "content": turn["content"]} for turn in conversation_history]
-
-
 def answer_account_question(
     question: str,
     context_blob: str,
     conversation_history: list,
     anthropic_api_key: str = None,
-    gemini_api_key: str = None,
+    groq_api_key: str = None,
     provider_override: str = None,
 ) -> str:
     """
@@ -285,15 +262,15 @@ def answer_account_question(
       mostly aggregate, plus individual watchlist/growth-target rows by
       informed decision) -- built ONCE per batch run by the caller, not
       rebuilt per question.
-    - conversation_history: prior turns as a list of {"role", "content", ...}
+    - conversation_history: prior turns as a plain list of {"role", "content"}
       dicts (role is "user" or "assistant"). READ for multi-turn context AND
       MUTATED IN PLACE -- this call's question and answer are appended before
       returning, so the SAME list object should be passed across turns within
       a session (see the module docstring's "Multi-turn conversation" section
       for exactly what gets appended and why).
-    - anthropic_api_key, gemini_api_key, provider_override: identical contract
+    - anthropic_api_key, groq_api_key, provider_override: identical contract
       to generate_account_digest() in src/digest_engine.py -- _resolve_provider()
-      (imported, not re-derived) makes the same Gemini-preferred-by-default /
+      (imported, not re-derived) makes the same Groq-preferred-by-default /
       Anthropic-fallback / "none" decision.
 
     Returns the answer text. NEVER raises: on any failure (no key configured,
@@ -306,60 +283,44 @@ def answer_account_question(
     clean chain from the last SUCCESSFUL turn.
     """
     conversation_history = conversation_history if conversation_history is not None else []
-    provider = _resolve_provider(anthropic_api_key, gemini_api_key, override=provider_override)
+    provider = _resolve_provider(anthropic_api_key, groq_api_key, override=provider_override)
 
     if provider == "none":
-        return _chat_unavailable("no GEMINI_API_KEY or ANTHROPIC_API_KEY configured")
+        return _chat_unavailable("no GROQ_API_KEY or ANTHROPIC_API_KEY configured")
 
     system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob=context_blob)
 
-    if provider == "gemini":
-        if genai is None:
-            return _chat_unavailable("google-genai package not installed")
-        # Shared call/error-handling logic -- see digest_engine.py's
-        # _call_gemini() docstring for why this is extracted (also used by
-        # generate_account_digest()) and why the "package missing" check
-        # above stays here rather than moving inside it. Unlike the digest,
-        # chat DOES pass a real system prompt and chains multi-turn context
-        # via previous_interaction_id -- both caller-specific concerns
-        # (computing system_prompt, finding the prior interaction id,
-        # appending to conversation_history) stay here; _call_gemini() only
-        # owns the call itself and its error classification.
-        previous_interaction_id = _last_gemini_interaction_id(conversation_history)
-        text, interaction_id, failure_reason = _call_gemini(
-            prompt_or_input=question,
-            system_instruction=system_prompt,
-            api_key=gemini_api_key,
-            max_output_tokens=CHAT_MAX_OUTPUT_TOKENS,
-            previous_interaction_id=previous_interaction_id,
+    # Shared call/error-handling logic for whichever provider resolves -- see
+    # _call_groq()/_call_anthropic()'s own docstrings in digest_engine.py
+    # (also used by generate_account_digest()). Building `messages` from
+    # conversation_history plus this turn's question is chat-specific and
+    # stays here, same as the system-prompt handling below (a fresh {"role":
+    # "system", ...} entry for Groq's OpenAI-compatible shape, Anthropic's
+    # own separate `system=` field for Anthropic) -- neither shared function
+    # does any of this bookkeeping itself.
+    if provider == "groq":
+        if groq is None:
+            return _chat_unavailable("groq package not installed")
+        messages = [{"role": "system", "content": system_prompt}] + conversation_history + [
+            {"role": "user", "content": question}
+        ]
+        text, failure_reason = _call_groq(
+            messages=messages,
+            api_key=groq_api_key,
+            max_tokens=CHAT_MAX_OUTPUT_TOKENS,
         )
-        if failure_reason:
-            return _chat_unavailable(failure_reason)
+    else:
+        # provider == "anthropic"
+        if anthropic is None:
+            return _chat_unavailable("anthropic package not installed")
+        messages = conversation_history + [{"role": "user", "content": question}]
+        text, failure_reason = _call_anthropic(
+            messages=messages,
+            api_key=anthropic_api_key,
+            max_tokens=CHAT_MAX_OUTPUT_TOKENS,
+            system=system_prompt,
+        )
 
-        conversation_history.append({"role": "user", "content": question})
-        conversation_history.append({
-            "role": "assistant",
-            "content": text,
-            "gemini_interaction_id": interaction_id,
-        })
-        return text
-
-    # provider == "anthropic"
-    if anthropic is None:
-        return _chat_unavailable("anthropic package not installed")
-    # Shared call/error-handling logic -- see digest_engine.py's
-    # _call_anthropic() docstring (also used by generate_account_digest()).
-    # Building `messages` from conversation_history plus this turn's question
-    # is chat-specific and stays here, same as the Gemini branch above.
-    messages = _anthropic_messages_from_history(conversation_history) + [
-        {"role": "user", "content": question}
-    ]
-    text, failure_reason = _call_anthropic(
-        messages=messages,
-        api_key=anthropic_api_key,
-        max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-        system=system_prompt,
-    )
     if failure_reason:
         return _chat_unavailable(failure_reason)
 

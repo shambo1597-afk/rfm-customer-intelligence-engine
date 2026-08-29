@@ -47,7 +47,7 @@ from src.shopify_ingest import (
 from src.digest_engine import (
     generate_account_digest,
     get_anthropic_api_key,
-    get_gemini_api_key,
+    get_groq_api_key,
     get_digest_provider_override
 )
 from src.chat_context import build_account_context_blob, build_context_text
@@ -270,18 +270,18 @@ def cached_compute_monthly_cohort_matrix(clean_tx: pd.DataFrame):
 def cached_generate_account_digest(rfmt_df: pd.DataFrame, clv_df: pd.DataFrame,
                                     segment_summary: pd.DataFrame,
                                     anthropic_api_key: str = None,
-                                    gemini_api_key: str = None,
+                                    groq_api_key: str = None,
                                     provider_override: str = None):
     # Cached (keyed on the data + keys/override) so this only calls the LLM provider
     # once per account per batch run -- Streamlit reruns the whole script on every
     # widget interaction elsewhere in the app, and without this cache each of those
     # reruns would fire a fresh API call, silently multiplying the "one call per
     # account per batch run" cost model this feature was built around (see
-    # src/digest_engine.py). Gemini is preferred by default when both keys are set.
+    # src/digest_engine.py). Groq is preferred by default when both keys are set.
     return generate_account_digest(
         rfmt_df, clv_df, segment_summary,
         anthropic_api_key=anthropic_api_key,
-        gemini_api_key=gemini_api_key,
+        groq_api_key=groq_api_key,
         provider_override=provider_override
     )
 
@@ -543,21 +543,19 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🤖 AI Executive Summary")
     enable_ai_digest = st.checkbox(
-        "Enable AI Digest — Gemini (default) or Anthropic",
+        "Enable AI Digest — Groq (default) or Anthropic",
         value=False,
         help=(
             "Off by default. Generates ONE narrative paragraph per account per view "
             "from already-computed aggregate stats (never raw customer rows) — see "
             "README § AI Executive Summary (Optional) for the cost model "
-            "(Gemini's Flash-Lite tier, historically free-tier-eligible, by default; "
-            "~$1/month on Anthropic at pilot volume; vs. ~$208/month for a "
-            "per-customer design — confirm current Gemini pricing before relying on "
-            "$0). Configure GEMINI_API_KEY "
+            "(Groq's free tier — no credit card, genuinely $0 at this project's call "
+            "volume — by default; ~$1/month on Anthropic at pilot volume; vs. "
+            "~$208/month for a per-customer design). Configure GROQ_API_KEY "
             "and/or ANTHROPIC_API_KEY in st.secrets/env — either enables this feature, "
-            "and Gemini is used by default when both are present. Note: on Gemini's "
-            "free tier, Google may use submitted content to improve their products — "
-            "see README for the full data-usage disclosure before enabling in a "
-            "production deployment."
+            "and Groq is used by default when both are present. See README for the "
+            "current free-tier rate limits and data-usage disclosure before enabling "
+            "in a production deployment."
         )
     )
     enable_chat_qa = st.checkbox(
@@ -576,10 +574,10 @@ with st.sidebar:
     )
     resolve_llm_keys = enable_ai_digest or enable_chat_qa
     anthropic_api_key = get_anthropic_api_key() if resolve_llm_keys else None
-    gemini_api_key = get_gemini_api_key() if resolve_llm_keys else None
+    groq_api_key = get_groq_api_key() if resolve_llm_keys else None
     digest_provider_override = get_digest_provider_override() if resolve_llm_keys else None
-    if resolve_llm_keys and not anthropic_api_key and not gemini_api_key:
-        st.caption("⚠️ No GEMINI_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A will be unavailable.")
+    if resolve_llm_keys and not anthropic_api_key and not groq_api_key:
+        st.caption("⚠️ No GROQ_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A will be unavailable.")
 
     st.markdown("---")
     st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
@@ -829,12 +827,12 @@ with tab2:
             digest_text = cached_generate_account_digest(
                 rfmt_df, clv_df, segment_summary,
                 anthropic_api_key=anthropic_api_key,
-                gemini_api_key=gemini_api_key,
+                groq_api_key=groq_api_key,
                 provider_override=digest_provider_override
             )
             st.markdown(digest_text)
-            if not anthropic_api_key and not gemini_api_key:
-                st.caption("ℹ️ Showing the template summary — configure GEMINI_API_KEY (free) or ANTHROPIC_API_KEY for the AI-generated version.")
+            if not anthropic_api_key and not groq_api_key:
+                st.caption("ℹ️ Showing the template summary — configure GROQ_API_KEY (free) or ANTHROPIC_API_KEY for the AI-generated version.")
         else:
             st.info("Enable \"AI Digest\" in the sidebar to generate this summary.")
 
@@ -885,7 +883,7 @@ with tab2:
                         question, context_text,
                         st.session_state["chat_conversation_history"],
                         anthropic_api_key=anthropic_api_key,
-                        gemini_api_key=gemini_api_key,
+                        groq_api_key=groq_api_key,
                         provider_override=digest_provider_override,
                     )
                 with st.chat_message("assistant"):
@@ -895,8 +893,8 @@ with tab2:
                 # failed turn is intentionally NOT recorded, so nothing more to
                 # do here either way.
 
-            if not anthropic_api_key and not gemini_api_key:
-                st.caption("ℹ️ Configure GEMINI_API_KEY (free) or ANTHROPIC_API_KEY to enable Chat Q&A answers.")
+            if not anthropic_api_key and not groq_api_key:
+                st.caption("ℹ️ Configure GROQ_API_KEY (free) or ANTHROPIC_API_KEY to enable Chat Q&A answers.")
         else:
             st.info("Enable \"Chat Q&A\" in the sidebar to ask questions about this account.")
 
