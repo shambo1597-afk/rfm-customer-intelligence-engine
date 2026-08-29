@@ -50,27 +50,36 @@ not just in a slide, and doesn't get silently violated by a well-intentioned
 
 --- Provider details ---
 
-Gemini (default, GEMINI_MODEL_ID below): pinned to gemini-3.5-flash-lite, the
-Flash-Lite-tier model Google's own API error message names as the replacement
-for the now-dead gemini-2.5-flash-lite (see "Model deprecation incident,
-2026-08-29" below). Do not swap GEMINI_MODEL_ID for a Pro model -- Pro models
-require billing to be configured and are not expected to be free-tier eligible.
+Gemini (default, GEMINI_MODEL_ID below): gemini-flash-lite-latest -- Google's
+rolling alias for the current recommended Flash-Lite-tier model, chosen
+DELIBERATELY over pinning a specific dated model name (e.g.
+gemini-3.5-flash-lite, which this constant was briefly set to) after the
+incident below: a pinned dated model gets silently deprecated out from under
+this code with no warning and no code change to point at, whereas the
+"-latest" alias is Google's own mechanism for always resolving to whatever
+Flash-Lite-tier model is currently recommended, without this file needing an
+update each time. The accepted tradeoff is the mirror image of pinning: the
+model actually answering a call can change (and with it, potentially,
+behavior or pricing) without a corresponding change in this codebase's git
+history -- there is no changelog signal here when Google repoints the alias.
+Do not swap GEMINI_MODEL_ID for a Pro model -- Pro models require billing to
+be configured and are not expected to be free-tier eligible.
 
-  Pricing/free-tier status NOT independently re-verified for this specific
-  model as of the date below -- ai.google.dev/gemini-api/docs/pricing was
-  unreachable from this environment (network egress blocks that domain) when
-  this fix was made, so the earlier $0.10/$0.40-per-1M-token and "genuinely
-  free" claims that were previously stated here for gemini-2.5-flash-lite are
-  DELIBERATELY NOT carried forward onto gemini-3.5-flash-lite without
-  verification -- doing so would silently rot the same way the original
-  deprecation-date assumption did (see incident note below). What IS confirmed
-  (live API calls against a real account, not docs): the model is listed via
-  client.models.list(), it is the Flash-Lite tier (same lineage as the prior
-  default), and real generate_account_digest() calls against it succeed and
-  return real generated text. Confirm current pricing/free-tier status in
-  Google AI Studio or the live pricing page before treating this as a $0
-  guarantee for a new deployment, and update this note (and the README's
-  cost-model section, which cites the same figures) once re-verified.
+  Pricing/free-tier status NOT independently re-verified for whatever specific
+  model the alias currently resolves to -- ai.google.dev/gemini-api/docs/
+  pricing was unreachable from this environment (network egress blocks that
+  domain) when this and the preceding fix were made, so no specific $/1M-token
+  or "genuinely free" claim is stated here without verification -- doing so
+  would silently rot the same way the original deprecation-date assumption
+  did (see incident note below). What IS confirmed (live API calls against a
+  real account, not docs, both before and after switching to the alias): the
+  alias is listed via client.models.list(), it resolves to a Flash-Lite-tier
+  model (same lineage as every prior default), and real
+  generate_account_digest() calls against it succeed and return real
+  generated text. Confirm current pricing/free-tier status in Google AI
+  Studio or the live pricing page before treating this as a $0 guarantee for
+  a new deployment, and update this note (and the README's cost-model
+  section, which cites the same caveat) once re-verified.
 
   Model deprecation incident, 2026-08-29: gemini-2.5-flash-lite (and, tested
   for comparison, gemini-2.5-flash) started returning `404 NotFoundError` --
@@ -81,13 +90,20 @@ require billing to be configured and are not expected to be free-tier eligible.
   reflect per-model callability -- do not trust it alone). Both
   client.interactions.create() AND the older client.models.generate_content()
   failed identically (same 404, same message) for the dead models, and both
-  succeeded identically for gemini-3.5-flash-lite -- ruling out, for this
+  succeeded identically for the working candidates tested (including
+  gemini-3.5-flash-lite and gemini-flash-lite-latest) -- ruling out, for this
   account, an earlier hypothesis that the Interactions API specifically was
   broken for Flash-tier models. This was a straightforward model deprecation,
   not an API-method bug, so no API-method change was made here (still
-  client.interactions.create() below, unchanged). Re-verify GEMINI_MODEL_ID
-  against client.models.list() periodically -- a model listed today is not
-  guaranteed to stay callable, per this incident.
+  client.interactions.create() below, unchanged). GEMINI_MODEL_ID was
+  initially set to the specific gemini-3.5-flash-lite as the immediate fix,
+  then changed to the gemini-flash-lite-latest rolling alias once it became
+  clear that pinning a dated model name is exactly what caused this incident
+  in the first place, and that dated model is itself expected to be
+  deprecated in turn. Re-verify the alias still resolves to a working model
+  via client.models.list() periodically regardless -- an alias is not
+  immunity from Google discontinuing the entire Flash-Lite tier, only from
+  needing a code change every time the *dated* model underneath it rotates.
 
   DATA-USAGE DISCLOSURE (read before deploying on the free tier): per Google's
   own pricing page, content sent to the Gemini API on the FREE TIER **is used to
@@ -163,10 +179,13 @@ MODEL_ID = "claude-haiku-4-5"
 MAX_TOKENS = 300
 REQUEST_TIMEOUT_SECONDS = 20.0
 
-# Gemini: default provider -- see the module docstring's "Provider details" and
-# "Model deprecation incident, 2026-08-29" above for why this is
-# gemini-3.5-flash-lite and not gemini-2.5-flash-lite.
-GEMINI_MODEL_ID = "gemini-3.5-flash-lite"
+# Gemini: default provider -- a rolling alias, not a dated model, deliberately
+# -- see the module docstring's "Provider details" and "Model deprecation
+# incident, 2026-08-29" above for why (a pinned dated model, most recently
+# gemini-2.5-flash-lite then briefly gemini-3.5-flash-lite, is exactly what
+# broke here; the "-latest" alias always resolves to Google's current
+# recommended Flash-Lite-tier model without needing a code change).
+GEMINI_MODEL_ID = "gemini-flash-lite-latest"
 # Mirrors MAX_TOKENS's role for Anthropic: short paragraph only, bounds worst-case
 # cost. Passed as generation_config={"max_output_tokens": ...} on the
 # interactions.create() call below (google.genai.types.GenerationConfig's field).
