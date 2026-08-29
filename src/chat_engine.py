@@ -1,25 +1,32 @@
 """
-src/chat_engine.py - Optional Chat Q&A over a precomputed aggregate context blob.
+src/chat_engine.py - Optional Chat Q&A over a precomputed context blob.
 
 Lets a user ask natural-language questions about ONE account's customer
 intelligence, answered ONLY from a context blob built once per batch run by
 src/chat_context.py -- never by live-querying rfmt_df/clv_df, never by calling
 back into src/rfm_engine.py / src/clv_engine.py mid-conversation, never with its
 own pandas computation. If a question asks for something the blob doesn't
-contain (a hypothetical/what-if, a raw per-customer lookup, anything needing
-live computation), the model is instructed to say so plainly rather than
-invent a plausible-sounding answer -- see CHAT_SYSTEM_PROMPT_TEMPLATE below.
+contain (a hypothetical/what-if, a customer not in the watchlist/growth-target
+lists, anything needing live computation), the model is instructed to say so
+plainly rather than invent a plausible-sounding answer -- see
+CHAT_SYSTEM_PROMPT_TEMPLATE below.
 
 --- Why this is NOT open-ended chat with live tool-calling ---
 
 This is an ADDITIONAL optional feature alongside the existing per-account
 digest (src/digest_engine.py), not a replacement for it, and deliberately not
 a general-purpose agent: no tool/function-calling back into the pipeline
-mid-conversation, no access to raw per-customer rows (the context blob is
-100% aggregate -- see src/chat_context.py's module docstring and PII posture),
-and no new pandas computation happens inside a chat turn. The reasoning
-mirrors digest_engine.py's cost-model rationale almost exactly, with one
-important difference in shape -- see the cost model section below.
+mid-conversation, and no new pandas computation happens inside a chat turn.
+Most of the context blob is aggregate-only; by an explicit, informed decision
+(see src/chat_context.py's module docstring "PII posture" section), individual
+CustomerID-level rows from exactly two already-prioritized tables -- the churn
+watchlist and growth targets -- now reach the blob and this model, because the
+two datasets bundled with this repo carry no real personal-privacy exposure.
+That exception is narrow and does NOT extend to real customer data -- see the
+same module's load-bearing caveat about src/shopify_ingest.py before ever
+reusing this design against a live store. The reasoning otherwise mirrors
+digest_engine.py's cost-model rationale almost exactly, with one important
+difference in shape -- see the cost model section below.
 
 --- Providers, model, and error handling: reused, not re-derived ---
 
@@ -110,20 +117,36 @@ CHAT_SYSTEM_PROMPT_TEMPLATE = (
     "You are a data assistant answering questions about ONE business account's "
     "customer intelligence dashboard, for the analyst reviewing it. Answer ONLY "
     "using the CONTEXT DATA below -- it is the complete, already-computed "
-    "aggregate summary for this account. Never invent numbers not present in "
-    "it, never speculate about data it doesn't contain, and never discuss or "
-    "imply access to individual customers by ID or name (the CONTEXT DATA "
-    "contains none -- it is aggregate-only by design).\n\n"
+    "summary for this account. Never invent numbers not present in it, and "
+    "never speculate about data it doesn't contain.\n\n"
+    "Individual customers: the CHURN WATCHLIST and TOP 90-DAY GROWTH TARGETS "
+    "sections each include an \"Individual accounts\" list with real "
+    "CustomerIDs and their data (spend, recency, frequency, segment, and "
+    "either P(Alive)/risk tier or predicted 90-day spend) -- these ARE "
+    "legitimately available to reference. When asked a \"which/who\" question "
+    "(e.g. \"which 5 customers should I focus on\", \"who are my top churn "
+    "risks\"), answer with the actual CustomerIDs and figures from those "
+    "lists -- do not refuse or fall back to a vague aggregate answer when the "
+    "specific data is right there in front of you. But stay scoped to exactly "
+    "those two lists: if asked about a CustomerID that does NOT appear in "
+    "either \"Individual accounts\" list, say plainly that customer isn't in "
+    "the current watchlist/growth-target data -- do not fabricate details "
+    "about them, and do not imply access to the full customer base (this "
+    "context contains individual rows for ONLY those two prioritized lists, "
+    "not every customer on the account). Also never invent or imply access to "
+    "any customer detail beyond what those lists actually contain -- no names, "
+    "emails, addresses, or raw transaction history; CustomerID plus the listed "
+    "fields is the full extent of what's available per customer.\n\n"
     "If a question asks for something the CONTEXT DATA cannot answer -- a "
     "hypothetical or what-if scenario (e.g. \"what if I raised prices 10%\"), "
-    "a raw per-customer lookup, or anything requiring computation beyond what "
-    "is already summarized below -- say plainly that the current dashboard "
-    "data can't answer that, rather than guessing or fabricating a "
-    "plausible-sounding response. A short, honest \"I can't answer that from "
-    "the current data\" is always preferable to a fabricated number. If a "
-    "question is about HOW the scoring/segmentation/CLV model works, its "
-    "accuracy, or its limitations -- rather than about this account's "
-    "specific numbers -- answer using the MODEL METHODOLOGY & KNOWN "
+    "a customer not in either individual-accounts list, or anything requiring "
+    "computation beyond what is already summarized below -- say plainly that "
+    "the current dashboard data can't answer that, rather than guessing or "
+    "fabricating a plausible-sounding response. A short, honest \"I can't "
+    "answer that from the current data\" is always preferable to a fabricated "
+    "answer. If a question is about HOW the scoring/segmentation/CLV model "
+    "works, its accuracy, or its limitations -- rather than about this "
+    "account's specific numbers -- answer using the MODEL METHODOLOGY & KNOWN "
     "LIMITATIONS section of the CONTEXT DATA, and be exactly as candid about "
     "limitations (the CLV model being a heuristic, not a fitted probabilistic "
     "one; the real-data backtest not beating the naive baseline; the ML "
@@ -183,8 +206,9 @@ def answer_account_question(
 
     Parameters:
     - question: the analyst's natural-language question for this turn.
-    - context_blob: the serialized, aggregate-only context text (see
-      src/chat_context.py) -- built ONCE per batch run by the caller, not
+    - context_blob: the serialized context text (see src/chat_context.py --
+      mostly aggregate, plus individual watchlist/growth-target rows by
+      informed decision) -- built ONCE per batch run by the caller, not
       rebuilt per question.
     - conversation_history: prior turns as a list of {"role", "content", ...}
       dicts (role is "user" or "assistant"). READ for multi-turn context AND

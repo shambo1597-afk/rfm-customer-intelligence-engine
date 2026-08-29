@@ -384,7 +384,7 @@ rfm-customer-intelligence-engine/
 ├── sample_transactions.csv            # Compatibility transaction dataset
 ├── src/
 │   ├── __init__.py                    # Module export definitions
-│   ├── chat_context.py                # Chat Q&A: builds the aggregate-only context blob (once per batch run)
+│   ├── chat_context.py                # Chat Q&A: builds the context blob (once per batch run; mostly aggregate)
 │   ├── chat_engine.py                 # Optional Chat Q&A over the context blob (Gemini free tier / Anthropic)
 │   ├── clv_engine.py                  # Heuristic BTYD-inspired P(Alive), 90d CLV, & Churn Radar
 │   ├── cohort_engine.py               # Monthly acquisition cohort matrix & Plotly retention heatmaps
@@ -579,13 +579,16 @@ Set `GEMINI_API_KEY` and/or `ANTHROPIC_API_KEY` via `st.secrets` or an environme
 
 ### What it does — and deliberately does NOT do
 
-This is a **constrained Q&A chatbot over precomputed aggregate data**, not an open-ended agent:
+This is a **constrained Q&A chatbot over a precomputed context blob**, not an open-ended agent:
 
-- **What it does:** answers questions using ONLY a structured context blob (`src/chat_context.py`) built **once per batch run** — the same cadence as the AI Digest — from output the pipeline has already computed: the segment breakdown, the churn watchlist (size, value, composition), top 90-day growth targets (size, value, composition), average cohort retention by month-since-acquisition, and the Segment × ML Cluster agreement summary. If a question asks for something not in that blob, the model is instructed to say so plainly rather than guess.
-- **What it will NOT do:**
+- **What it does:** answers questions using ONLY a structured context blob (`src/chat_context.py`) built **once per batch run** — the same cadence as the AI Digest — from output the pipeline has already computed: the segment breakdown, cohort retention, the Segment × ML Cluster agreement summary, model methodology/known limitations (see below), and — as of this revision — the churn watchlist and top 90-day growth targets, **each with both an aggregate summary (size, value, composition) AND individual account detail**. If a question asks for something not in that blob, the model is instructed to say so plainly rather than guess.
+- **Individual-customer answers, scoped to exactly two lists.** The chatbot can now answer "which specific customers" questions — e.g. *"which 5 customers should I focus on right now?"* — with real `CustomerID`-level detail (spend, recency, frequency, segment, and either P(Alive)/risk tier or predicted 90-day spend), but **only** for accounts already on the churn watchlist or the growth-target list (up to 20 and 10 accounts respectively). Ask about a customer on neither list and it correctly says so rather than fabricating anything — the exposure does not extend to the full customer base.
+- **Why this is safe for the data in this repo, specifically:** both bundled datasets carry no real personal-privacy exposure — the UCI Online Retail dataset is long-published, anonymized academic data (integer CustomerIDs, no names/emails/addresses), and the synthetic generator's output is fictional by construction. Sending a CustomerID from either to an LLM API — including Gemini's free tier, where content may be used to improve Google's products (see the data-usage disclosure above) — has no real person behind it to expose.
+  > **⚠️ This reasoning does NOT extend to real customer data.** It is scoped specifically to `data/ecommerce_transactions.csv` and `data/real_online_retail.csv[.gz]`. If this pipeline is ever pointed at a real, live store's data (e.g. via the Shopify ingest above), real CustomerIDs/order data are **not** the same privacy case — this design decision (individual rows reaching an LLM API) **must be re-evaluated before enabling Chat Q&A** against that data. See `src/chat_context.py`'s module docstring for the same caveat, restated at the code level.
+- **What it will still NOT do:**
   - **No live tool-calling.** The model never calls back into `src/rfm_engine.py`, `src/clv_engine.py`, or any other engine mid-conversation — the context blob is fixed for the whole session, built before the chat UI is even shown.
-  - **No raw per-customer lookups.** The blob is 100% aggregate — no `CustomerID`, no individual transaction rows — the exact same PII posture as the AI Digest's `_build_aggregate_stats()` (see `tests/test_chat_context.py`'s PII-exclusion test, which mirrors the digest's own).
-  - **No hypothetical/what-if scenarios.** "What if I raised prices 10%?" is exactly the kind of question this feature is instructed to decline honestly rather than fabricate an answer for — verified manually against a live API key: it responds "I can't answer that from the current data" rather than inventing a number.
+  - **No access beyond the two prioritized lists.** Everything outside the watchlist/growth-target individual rows remains 100% aggregate — no raw transaction history, no customer names/emails, and no per-customer detail for any account *not* on either list.
+  - **No hypothetical/what-if scenarios.** "What if I raised prices 10%?" is exactly the kind of question this feature is instructed to decline honestly rather than fabricate an answer for.
 
 ### Cost model — usage-based, NOT the digest's fixed per-batch-run cost
 
@@ -627,7 +630,7 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 
 | Module | Statements | Coverage |
 |:---|---:|---:|
-| `src/chat_context.py` | 40 | 100% |
+| `src/chat_context.py` | 67 | 100% |
 | `src/chat_engine.py` | 70 | 100% |
 | `src/clv_engine.py` | 42 | 100% |
 | `src/cohort_engine.py` | 56 | 100% |
@@ -635,7 +638,7 @@ Current measured coverage (`pytest-cov`, `src/` only — re-run the command abov
 | `src/ml_engine.py` | 59 | 98% |
 | `src/rfm_engine.py` | 155 | 100% |
 | `src/shopify_ingest.py` | 111 | 100% |
-| **Total** | **648** | **99%** |
+| **Total** | **675** | **99%** |
 
 *(This replaces an earlier, unmeasured "100% test coverage" claim — the number above is the actual `pytest-cov` output on the synthetic dataset, not a target or an estimate.)*
 
