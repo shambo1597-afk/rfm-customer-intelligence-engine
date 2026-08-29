@@ -51,7 +51,7 @@ from src.digest_engine import (
     get_digest_provider_override
 )
 from src.chat_context import build_account_context_blob, build_context_text
-from src.chat_engine import answer_account_question
+from src.chat_engine import answer_account_question, escape_markdown_dollar_signs
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -863,14 +863,23 @@ with tab2:
             )
             context_text = build_context_text(context_blob)
 
+            # escape_markdown_dollar_signs() at every render site below --
+            # Streamlit's markdown renderer treats bare '$' pairs as LaTeX
+            # math delimiters by default (confirmed via the installed
+            # package's own JS bundle, not assumed -- see that function's
+            # docstring in src/chat_engine.py for the full root-cause and why
+            # this escaping, not a Streamlit config flag, is the actual fix).
+            # Applied to every message in this panel, not just the model's
+            # answer, since a user typing a literal '$' in their own question
+            # would hit the exact same bug when echoed back.
             for turn in st.session_state["chat_conversation_history"]:
                 with st.chat_message(turn["role"]):
-                    st.markdown(turn["content"])
+                    st.markdown(escape_markdown_dollar_signs(turn["content"]))
 
             question = st.chat_input("Ask a question about this account...")
             if question:
                 with st.chat_message("user"):
-                    st.markdown(question)
+                    st.markdown(escape_markdown_dollar_signs(question))
                 with st.spinner("Thinking..."):
                     answer = answer_account_question(
                         question, context_text,
@@ -880,7 +889,7 @@ with tab2:
                         provider_override=digest_provider_override,
                     )
                 with st.chat_message("assistant"):
-                    st.markdown(answer)
+                    st.markdown(escape_markdown_dollar_signs(answer))
                 # answer_account_question() already appended the successful turn
                 # to chat_conversation_history in place -- see its docstring. A
                 # failed turn is intentionally NOT recorded, so nothing more to
