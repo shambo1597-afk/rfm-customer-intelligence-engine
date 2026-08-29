@@ -120,7 +120,17 @@ CHAT_SYSTEM_PROMPT_TEMPLATE = (
     "is already summarized below -- say plainly that the current dashboard "
     "data can't answer that, rather than guessing or fabricating a "
     "plausible-sounding response. A short, honest \"I can't answer that from "
-    "the current data\" is always preferable to a fabricated number.\n\n"
+    "the current data\" is always preferable to a fabricated number. If a "
+    "question is about HOW the scoring/segmentation/CLV model works, its "
+    "accuracy, or its limitations -- rather than about this account's "
+    "specific numbers -- answer using the MODEL METHODOLOGY & KNOWN "
+    "LIMITATIONS section of the CONTEXT DATA, and be exactly as candid about "
+    "limitations (the CLV model being a heuristic, not a fitted probabilistic "
+    "one; the real-data backtest not beating the naive baseline; the ML "
+    "clustering being validation-only and never changing a customer's "
+    "segment) as that section itself is -- never soften or spin a documented "
+    "limitation into something more flattering than what the context data "
+    "actually says.\n\n"
     "CONTEXT DATA:\n{context_blob}\n"
 )
 
