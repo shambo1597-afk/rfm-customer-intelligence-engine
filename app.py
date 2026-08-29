@@ -36,7 +36,8 @@ from src.clv_engine import (
 from src.cohort_engine import (
     compute_monthly_cohort_matrix,
     create_cohort_retention_heatmap,
-    create_average_retention_curve
+    create_average_retention_curve,
+    find_notable_cohort_pattern
 )
 from src.shopify_ingest import (
     fetch_shopify_orders,
@@ -59,6 +60,7 @@ from src.roi_advisor import (
     DEFAULT_CONV_RATE_PCT,
     DEFAULT_GROSS_MARGIN_PCT,
 )
+from src.cohort_narration import narrate_cohort_pattern
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -321,6 +323,24 @@ def cached_get_roi_recommendation(question: str, allocations_df: pd.DataFrame, t
     # table.
     return get_roi_recommendation(
         question, allocations_df, total_budget,
+        anthropic_api_key=anthropic_api_key,
+        groq_api_key=groq_api_key,
+        provider_override=provider_override
+    )
+
+
+@st.cache_data(show_spinner="Narrating cohort pattern...")
+def cached_narrate_cohort_pattern(pattern: dict,
+                                   anthropic_api_key: str = None,
+                                   groq_api_key: str = None,
+                                   provider_override: str = None):
+    # Cached for the same reason as the two functions above -- there is at
+    # most ONE notable pattern per batch run (find_notable_cohort_pattern()
+    # returns a single dict, not a list), so without this cache an unrelated
+    # widget interaction elsewhere in the app would still silently
+    # re-trigger a fresh API call for the same finding.
+    return narrate_cohort_pattern(
+        pattern,
         anthropic_api_key=anthropic_api_key,
         groq_api_key=groq_api_key,
         provider_override=provider_override
@@ -612,12 +632,25 @@ with st.sidebar:
             "(Optional)."
         )
     )
-    resolve_llm_keys = enable_ai_digest or enable_chat_qa or enable_roi_advisor
+    enable_cohort_narration = st.checkbox(
+        "Enable Cohort Pattern Narration — uses the same API key as AI Digest",
+        value=False,
+        help=(
+            "Off by default. In the 📊 Executive KPI & Cohort Matrix tab, "
+            "deterministically identifies the single most statistically "
+            "unusual cohort-month cell in the retention matrix already shown "
+            "there (a plain z-score computation — real information on its own, "
+            "with zero API cost), then has the LLM explain it in one or two "
+            "plain-language sentences. See README § Cohort Pattern Narration "
+            "(Optional)."
+        )
+    )
+    resolve_llm_keys = enable_ai_digest or enable_chat_qa or enable_roi_advisor or enable_cohort_narration
     anthropic_api_key = get_anthropic_api_key() if resolve_llm_keys else None
     groq_api_key = get_groq_api_key() if resolve_llm_keys else None
     digest_provider_override = get_digest_provider_override() if resolve_llm_keys else None
     if resolve_llm_keys and not anthropic_api_key and not groq_api_key:
-        st.caption("⚠️ No GROQ_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A / AI Budget Advisor will be unavailable.")
+        st.caption("⚠️ No GROQ_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A / AI Budget Advisor / Cohort Pattern Narration will be unavailable.")
 
     st.markdown("---")
     st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
@@ -782,7 +815,50 @@ with tab1:
                     """,
                     unsafe_allow_html=True
                 )
-                
+
+                # 🔍 Notable Pattern -- gated behind its own off-by-default
+                # sidebar checkbox, same pattern as AI Digest/Chat Q&A above.
+                # find_notable_cohort_pattern() (src/cohort_engine.py) is a
+                # plain, deterministic z-score computation -- zero API cost,
+                # real information on its own -- so it's always shown in full
+                # once this section is enabled, regardless of whether an LLM
+                # key happens to be configured; the LLM narration below it is
+                # additive polish, never the only source of the finding (see
+                # src/cohort_narration.py's module docstring).
+                if enable_cohort_narration:
+                    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                    notable_pattern = find_notable_cohort_pattern(retention_matrix)
+                    if notable_pattern:
+                        st.markdown(
+                            f"""
+                            <div class="kpi-container">
+                                <div class="kpi-label">🔍 Notable Pattern</div>
+                                <div style="font-size: 0.90rem; line-height: 1.6; color: #E2E8F0;">
+                                    <strong>{notable_pattern['cohort']}</strong> cohort's
+                                    <strong>Month {notable_pattern['month_index']}</strong> retention is
+                                    <strong>{notable_pattern['retention_pct']:.1f}%</strong>
+                                    ({notable_pattern['deviation_pct_points']:+.1f} pts vs. the
+                                    {notable_pattern['column_mean_pct']:.1f}% average for other cohorts at
+                                    that same month — {notable_pattern['direction']}, z-score
+                                    {notable_pattern['z_score']:+.2f}).
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        if anthropic_api_key or groq_api_key:
+                            narration = cached_narrate_cohort_pattern(
+                                notable_pattern,
+                                anthropic_api_key=anthropic_api_key,
+                                groq_api_key=groq_api_key,
+                                provider_override=digest_provider_override,
+                            )
+                            st.markdown(escape_markdown_dollar_signs(narration))
+                        else:
+                            st.caption("ℹ️ Configure GROQ_API_KEY (free) or ANTHROPIC_API_KEY for a plain-language explanation of this finding.")
+                    else:
+                        st.caption("No statistically notable cohort pattern found yet (too few cohorts with overlapping history).")
+
         except Exception as err:
             st.warning(f"Unable to render cohort matrix: {err}")
 
