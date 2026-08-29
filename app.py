@@ -46,7 +46,9 @@ from src.shopify_ingest import (
 )
 from src.digest_engine import (
     generate_account_digest,
-    get_anthropic_api_key
+    get_anthropic_api_key,
+    get_gemini_api_key,
+    get_digest_provider_override
 )
 
 # Configure Streamlit Page
@@ -264,13 +266,22 @@ def cached_compute_monthly_cohort_matrix(clean_tx: pd.DataFrame):
 
 @st.cache_data(show_spinner="Generating AI executive summary...")
 def cached_generate_account_digest(rfmt_df: pd.DataFrame, clv_df: pd.DataFrame,
-                                    segment_summary: pd.DataFrame, api_key: str = None):
-    # Cached (keyed on the data + api_key) so this only calls the Anthropic API once
-    # per account per batch run -- Streamlit reruns the whole script on every widget
-    # interaction elsewhere in the app, and without this cache each of those reruns
-    # would fire a fresh API call, silently multiplying the "one call per account per
-    # batch run" cost model this feature was built around (see src/digest_engine.py).
-    return generate_account_digest(rfmt_df, clv_df, segment_summary, api_key=api_key)
+                                    segment_summary: pd.DataFrame,
+                                    anthropic_api_key: str = None,
+                                    gemini_api_key: str = None,
+                                    provider_override: str = None):
+    # Cached (keyed on the data + keys/override) so this only calls the LLM provider
+    # once per account per batch run -- Streamlit reruns the whole script on every
+    # widget interaction elsewhere in the app, and without this cache each of those
+    # reruns would fire a fresh API call, silently multiplying the "one call per
+    # account per batch run" cost model this feature was built around (see
+    # src/digest_engine.py). Gemini is preferred by default when both keys are set.
+    return generate_account_digest(
+        rfmt_df, clv_df, segment_summary,
+        anthropic_api_key=anthropic_api_key,
+        gemini_api_key=gemini_api_key,
+        provider_override=provider_override
+    )
 
 
 def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
@@ -515,18 +526,26 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🤖 AI Executive Summary")
     enable_ai_digest = st.checkbox(
-        "Enable AI Digest — uses Anthropic API",
+        "Enable AI Digest — Gemini (default) or Anthropic",
         value=False,
         help=(
             "Off by default. Generates ONE narrative paragraph per account per view "
             "from already-computed aggregate stats (never raw customer rows) — see "
             "README § AI Executive Summary (Optional) for the cost model "
-            "(~$1/month at pilot volume vs. ~$208/month for a per-customer design)."
+            "(~$0/month on Gemini's free tier, ~$1/month on Anthropic at pilot volume, "
+            "vs. ~$208/month for a per-customer design). Configure GEMINI_API_KEY "
+            "and/or ANTHROPIC_API_KEY in st.secrets/env — either enables this feature, "
+            "and Gemini is used by default when both are present. Note: on Gemini's "
+            "free tier, Google may use submitted content to improve their products — "
+            "see README for the full data-usage disclosure before enabling in a "
+            "production deployment."
         )
     )
     anthropic_api_key = get_anthropic_api_key() if enable_ai_digest else None
-    if enable_ai_digest and not anthropic_api_key:
-        st.caption("⚠️ No ANTHROPIC_API_KEY found in st.secrets/env — will show a template summary instead.")
+    gemini_api_key = get_gemini_api_key() if enable_ai_digest else None
+    digest_provider_override = get_digest_provider_override() if enable_ai_digest else None
+    if enable_ai_digest and not anthropic_api_key and not gemini_api_key:
+        st.caption("⚠️ No GEMINI_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — will show a template summary instead.")
 
     st.markdown("---")
     st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
@@ -741,10 +760,15 @@ with tab2:
             "Summary (Optional) for the cost model."
         )
         if enable_ai_digest:
-            digest_text = cached_generate_account_digest(rfmt_df, clv_df, segment_summary, api_key=anthropic_api_key)
+            digest_text = cached_generate_account_digest(
+                rfmt_df, clv_df, segment_summary,
+                anthropic_api_key=anthropic_api_key,
+                gemini_api_key=gemini_api_key,
+                provider_override=digest_provider_override
+            )
             st.markdown(digest_text)
-            if not anthropic_api_key:
-                st.caption("ℹ️ Showing the template summary — configure ANTHROPIC_API_KEY for the AI-generated version.")
+            if not anthropic_api_key and not gemini_api_key:
+                st.caption("ℹ️ Showing the template summary — configure GEMINI_API_KEY (free) or ANTHROPIC_API_KEY for the AI-generated version.")
         else:
             st.info("Enable \"AI Digest\" in the sidebar to generate this summary.")
 
