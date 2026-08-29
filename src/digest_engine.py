@@ -132,6 +132,35 @@ be configured and are not expected to be free-tier eligible.
   `400 BadRequestError` with `'API_KEY_INVALID'` in the body, not 401/403 as
   HTTP convention might suggest -- both are checked below.
 
+  Request-hangs-indefinitely note, 2026-08-29: confirmed via live testing that
+  `client.interactions.create()` calls made with no timeout configured can hang
+  forever -- no response, no exception, no timeout -- roughly 1 in 4-5 calls in
+  a small hand-run sample (NOT a precise measured rate, just what a handful of
+  manual reproduction attempts showed). This is a known, currently-open bug in
+  the google-genai SDK itself, not something specific to this codebase --
+  see googleapis/python-genai#1893 ("Requests hang indefinitely") and #911
+  ("Setting timeout in genai.Client() does not work"). Per #911, the
+  client-construction-time `genai.Client(http_options=HttpOptions(timeout=...))`
+  path is documented as unreliable/broken by Google's own SDK maintainers --
+  DO NOT rely on it. The fix confirmed to actually work (reproduced directly:
+  repeated calls with `timeout=8.0` produced real `APITimeoutError` raises at
+  ~8.0s each instead of hanging) is the PER-CALL `timeout=` keyword argument on
+  `interactions.create()` itself, below (GEMINI_REQUEST_TIMEOUT_SECONDS). This
+  is a genuinely different code path from the broken client-level
+  `http_options` -- do not "simplify" it back to that pattern.
+  `genai_errors.APITimeoutError` (a subclass of `APIConnectionError`, itself a
+  subclass of `APIError` -- confirmed by reading the installed SDK's
+  `compat_errors` module, not assumed) is raised when the per-call timeout is
+  hit, and is caught below with its own distinct fallback reason so a genuine
+  timeout is never conflated with a rate limit or an invalid key.
+
+  This is a disclosed limitation, not something today's fix eliminates: making
+  a hung call fail fast after GEMINI_REQUEST_TIMEOUT_SECONDS instead of hanging
+  the UI forever does not make the underlying SDK flakiness go away. A real
+  user may see the "Gemini API request timed out" fallback message more often
+  than the rate-limit or invalid-key fallbacks above -- that is expected given
+  the open upstream bug, not a regression in this code.
+
 Anthropic (fallback, MODEL_ID below): Claude Haiku 4.5, $1.00 / $5.00 per 1M
 input/output tokens -- the "small/cheap model" tier, not free, but Anthropic's
 standard paid-API terms do not use submitted content to train models.
@@ -190,6 +219,19 @@ GEMINI_MODEL_ID = "gemini-flash-lite-latest"
 # cost. Passed as generation_config={"max_output_tokens": ...} on the
 # interactions.create() call below (google.genai.types.GenerationConfig's field).
 GEMINI_MAX_OUTPUT_TOKENS = 300
+# Request-level timeout for client.interactions.create() -- see the module
+# docstring's "Request-hangs-indefinitely note" above (googleapis/python-genai
+# #1893, #911): without this, a call can hang forever with no exception. 20s is
+# generous enough for a normal, slower-than-usual real response to still
+# succeed, short enough that a hung request fails fast rather than blocking the
+# Streamlit UI indefinitely. MUST be passed as the PER-CALL `timeout=` kwarg on
+# interactions.create() itself (as done below) -- NOT via
+# genai.Client(http_options=HttpOptions(timeout=...)) at client-construction
+# time, which #911 documents as unreliable/broken in this SDK. Mirrors
+# REQUEST_TIMEOUT_SECONDS's role for Anthropic, kept as a separate constant
+# rather than reused because it is passed through an entirely different
+# mechanism (a per-call kwarg here vs. client.with_options(timeout=...) there).
+GEMINI_REQUEST_TIMEOUT_SECONDS = 20.0
 
 # How many of the largest segments to name in the prompt (keeps the prompt compact).
 SEGMENTS_SHOWN_IN_PROMPT = 3
@@ -413,6 +455,11 @@ def generate_account_digest(
                 model=GEMINI_MODEL_ID,
                 input=prompt,
                 generation_config={"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
+                # Per-call timeout, NOT client-level http_options -- see
+                # GEMINI_REQUEST_TIMEOUT_SECONDS above (googleapis/python-genai
+                # #1893, #911): the client-level path is confirmed unreliable/
+                # broken for this SDK; this is the one confirmed to actually work.
+                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
             )
             text = (interaction.output_text or "").strip()
             return text if text else _fallback_digest(stats, reason="empty response from Gemini")
@@ -434,10 +481,21 @@ def generate_account_digest(
             if status_code in (401, 403) or "API_KEY_INVALID" in message:
                 return _fallback_digest(stats, reason="invalid Gemini API key")
             return _fallback_digest(stats, reason="Gemini API error")
+        except genai_errors.APITimeoutError:
+            # Raised when the per-call `timeout=GEMINI_REQUEST_TIMEOUT_SECONDS`
+            # above is hit -- see the module docstring's "Request-hangs-
+            # indefinitely note" (googleapis/python-genai#1893, #911). Caught
+            # BEFORE the broad genai_errors.APIError below (APITimeoutError is a
+            # subclass of APIConnectionError, itself a subclass of APIError, so
+            # it would otherwise be swallowed by that branch's generic message)
+            # with its own distinct reason -- a timeout is a genuinely different
+            # situation from a rate limit or an invalid key and should never be
+            # reported as either.
+            return _fallback_digest(stats, reason="Gemini API request timed out")
         except genai_errors.APIError:
             # Broad base class for everything else the SDK raises for this call
-            # (connection/timeout errors, and any future APIStatusError subclass
-            # not distinguished above) -- still a diagnosable "the SDK reported an
+            # (connection errors, and any future APIStatusError subclass not
+            # distinguished above) -- still a diagnosable "the SDK reported an
             # API error", not a truly unanticipated exception. Catching the base
             # class here (rather than only the specific subclasses above) means a
             # future error variant this code doesn't yet know about still gets a
