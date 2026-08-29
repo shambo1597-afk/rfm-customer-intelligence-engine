@@ -15,6 +15,7 @@ venv.bak/
 # Environment Variables & IDE configs
 .env
 .env.local
+.streamlit/secrets.toml
 .vscode/
 .idea/
 .DS_Store
