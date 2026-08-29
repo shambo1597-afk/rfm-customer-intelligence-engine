@@ -28,6 +28,7 @@ from src.digest_engine import (
     MAX_TOKENS,
     GEMINI_MODEL_ID,
     GEMINI_MAX_OUTPUT_TOKENS,
+    GEMINI_REQUEST_TIMEOUT_SECONDS,
 )
 
 
@@ -86,6 +87,14 @@ class TestNamedConstants:
         model_lower = GEMINI_MODEL_ID.lower()
         assert "flash-lite" in model_lower
         assert "pro" not in model_lower
+
+    def test_gemini_request_timeout_seconds_is_a_positive_module_level_constant(self):
+        # Per-call timeout fix for googleapis/python-genai#1893/#911 -- see
+        # module docstring's "Request-hangs-indefinitely note". Must be a real,
+        # finite, positive number of seconds, not left unset/None/0 (which would
+        # silently reopen the hang).
+        assert isinstance(GEMINI_REQUEST_TIMEOUT_SECONDS, (int, float))
+        assert GEMINI_REQUEST_TIMEOUT_SECONDS > 0
 
 
 class TestResolveProvider:
@@ -313,6 +322,28 @@ class TestSuccessfulGeminiCall:
         assert kwargs["model"] == GEMINI_MODEL_ID
         assert kwargs["generation_config"]["max_output_tokens"] == GEMINI_MAX_OUTPUT_TOKENS
 
+    def test_call_passes_the_per_call_timeout_kwarg_not_client_level_http_options(
+        self, rfmt_df, clv_df, segment_summary
+    ):
+        # Fix for googleapis/python-genai#1893/#911: the timeout MUST be the
+        # per-call `timeout=` kwarg on interactions.create() itself, confirmed
+        # working -- NOT genai.Client(http_options=...), confirmed broken/
+        # unreliable by the SDK maintainers per #911. This asserts the actual
+        # call site, not just that the constant exists.
+        mock_interaction = types.SimpleNamespace(output_text="Summary text.")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client) as mock_client_cls:
+            generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
+        # genai.Client() itself must only ever be constructed with api_key --
+        # never an http_options timeout, which would be the broken pattern.
+        _, client_kwargs = mock_client_cls.call_args
+        assert "http_options" not in client_kwargs
+
     def test_prompt_is_passed_as_the_input_parameter(self, rfmt_df, clv_df, segment_summary):
         mock_interaction = types.SimpleNamespace(output_text="Summary text.")
         mock_client = MagicMock()
@@ -453,6 +484,32 @@ class TestGeminiFailuresDegradeGracefully:
 
         assert "[Template Summary" in result
         assert "Gemini API error" in result
+
+    def test_timeout_falls_back_with_its_own_distinct_reason_never_hangs_the_test(
+        self, rfmt_df, clv_df, segment_summary
+    ):
+        # The actual bug this fix addresses: a hung client.interactions.create()
+        # call must never hang the caller. Mocking a raised APITimeoutError
+        # (rather than actually sleeping) proves the except clause routes to its
+        # own distinct reason -- if this test itself takes anywhere near
+        # GEMINI_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
+        exc = genai_errors.APITimeoutError(request=httpx.Request(
+            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        ))
+        assert isinstance(exc, genai_errors.APIError)
+        assert not isinstance(exc, genai_errors.APIStatusError)
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+
+        assert "[Template Summary" in result
+        assert "Gemini API request timed out" in result
+        # Must never be conflated with the other Gemini failure reasons.
+        assert "rate limit" not in result
+        assert "invalid Gemini API key" not in result
+        assert result.count("Gemini API error") == 0
 
     def test_connection_error_is_caught_by_the_broad_apierror_base_class(self, rfmt_df, clv_df, segment_summary):
         # APIConnectionError has no HTTP response/status_code at all (it's raised

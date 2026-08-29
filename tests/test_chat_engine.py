@@ -32,7 +32,7 @@ from src.chat_engine import (
     _last_gemini_interaction_id,
     _anthropic_messages_from_history,
 )
-from src.digest_engine import MODEL_ID, GEMINI_MODEL_ID
+from src.digest_engine import MODEL_ID, GEMINI_MODEL_ID, GEMINI_REQUEST_TIMEOUT_SECONDS
 
 
 def _make_gemini_api_error(status_code: int, message: str, reason: str = "", body: dict = None):
@@ -75,6 +75,7 @@ class TestNamedConstants:
         import src.chat_engine as chat_engine_module
         assert chat_engine_module.GEMINI_MODEL_ID is GEMINI_MODEL_ID
         assert chat_engine_module.MODEL_ID is MODEL_ID
+        assert chat_engine_module.GEMINI_REQUEST_TIMEOUT_SECONDS is GEMINI_REQUEST_TIMEOUT_SECONDS
 
 
 class TestSystemPromptInstructsScopeLimitation:
@@ -163,6 +164,23 @@ class TestSuccessfulGeminiCall:
         assert kwargs["generation_config"]["max_output_tokens"] == CHAT_MAX_OUTPUT_TOKENS
         assert kwargs["input"] == "A question?"
         assert "previous_interaction_id" not in kwargs  # first turn -- no prior interaction to chain from
+
+    def test_call_passes_the_per_call_timeout_kwarg_not_client_level_http_options(self, context_text):
+        # Fix for googleapis/python-genai#1893/#911 (see digest_engine.py's
+        # module docstring) -- the timeout MUST be the per-call `timeout=` kwarg
+        # on interactions.create(), confirmed working, NOT
+        # genai.Client(http_options=...), confirmed broken/unreliable.
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="interaction-timeout-kwarg")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.chat_engine.genai.Client", return_value=mock_client) as mock_client_cls:
+            answer_account_question("A question?", context_text, [], gemini_api_key="fake-gemini-key")
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
+        _, client_kwargs = mock_client_cls.call_args
+        assert "http_options" not in client_kwargs
 
     def test_system_instruction_carries_the_context_blob(self, context_text):
         mock_interaction = types.SimpleNamespace(output_text="An answer.", id="interaction-3")
@@ -285,6 +303,31 @@ class TestGeminiFailuresDegradeGracefully:
 
         assert "temporarily unavailable" in result
         assert "Gemini API error" in result
+
+    def test_timeout_falls_back_with_its_own_distinct_reason_never_hangs_the_test(self, context_text):
+        # The actual bug this fix addresses: a hung client.interactions.create()
+        # call must never hang the caller. Mocking a raised APITimeoutError
+        # (rather than actually sleeping) proves the except clause routes to its
+        # own distinct reason -- if this test itself takes anywhere near
+        # GEMINI_REQUEST_TIMEOUT_SECONDS to run, something is badly wrong.
+        exc = genai_errors.APITimeoutError(request=httpx.Request(
+            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        ))
+        assert isinstance(exc, genai_errors.APIError)
+        assert not isinstance(exc, genai_errors.APIStatusError)
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        history = []
+        with patch("src.chat_engine.genai.Client", return_value=mock_client):
+            result = answer_account_question("A question?", context_text, history, gemini_api_key="fake-gemini-key")
+
+        assert "temporarily unavailable" in result
+        assert "Gemini API request timed out" in result
+        assert "rate limit" not in result
+        assert "invalid Gemini API key" not in result
+        assert result.count("Gemini API error") == 0
+        assert history == []  # failed turn not recorded
 
     def test_connection_error_is_caught_by_the_broad_apierror_base_class(self, context_text):
         # APIConnectionError has no HTTP response/status_code (network-level

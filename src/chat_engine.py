@@ -40,12 +40,17 @@ digest_engine.py's:
     "Model deprecation incident" note) -- never re-guessed or re-pinned here,
     so a future model swap in digest_engine.py automatically applies to chat
     too, and the two features can never silently drift onto different models.
-  - REQUEST_TIMEOUT_SECONDS for the Anthropic client's request timeout.
+  - REQUEST_TIMEOUT_SECONDS for the Anthropic client's request timeout, and
+    GEMINI_REQUEST_TIMEOUT_SECONDS for the Gemini per-call `timeout=` kwarg on
+    interactions.create() -- see digest_engine.py's module docstring
+    "Request-hangs-indefinitely note" for why this must be the per-call kwarg
+    and never genai.Client(http_options=...) (confirmed unreliable/broken --
+    googleapis/python-genai#1893, #911).
   - The exact same exception classes for each provider (genai_errors.
-    APIStatusError / APIError for Gemini, anthropic.AuthenticationError /
-    RateLimitError / APIStatusError / APIConnectionError for Anthropic) --
-    the same classes digest_engine.py confirmed via direct reproduction
-    against the pinned SDK versions, not re-guessed here.
+    APIStatusError / APITimeoutError / APIError for Gemini, anthropic.
+    AuthenticationError / RateLimitError / APIStatusError / APIConnectionError
+    for Anthropic) -- the same classes digest_engine.py confirmed via direct
+    reproduction/inspection against the pinned SDK versions, not re-guessed here.
 
 --- Multi-turn conversation ---
 
@@ -103,6 +108,7 @@ from src.digest_engine import (
     MODEL_ID,
     GEMINI_MODEL_ID,
     REQUEST_TIMEOUT_SECONDS,
+    GEMINI_REQUEST_TIMEOUT_SECONDS,
 )
 
 # Chat answers get more room than the digest's 300-token cap (a single
@@ -248,6 +254,12 @@ def answer_account_question(
                 "input": question,
                 "system_instruction": system_prompt,
                 "generation_config": {"max_output_tokens": CHAT_MAX_OUTPUT_TOKENS},
+                # Per-call timeout, NOT client-level http_options -- see
+                # digest_engine.py's GEMINI_REQUEST_TIMEOUT_SECONDS and its
+                # "Request-hangs-indefinitely note" (googleapis/python-genai
+                # #1893, #911): the client-level path is confirmed unreliable/
+                # broken for this SDK; this is the one confirmed to actually work.
+                "timeout": GEMINI_REQUEST_TIMEOUT_SECONDS,
             }
             previous_interaction_id = _last_gemini_interaction_id(conversation_history)
             if previous_interaction_id:
@@ -276,6 +288,16 @@ def answer_account_question(
             if status_code in (401, 403) or "API_KEY_INVALID" in message:
                 return _chat_unavailable("invalid Gemini API key")
             return _chat_unavailable("Gemini API error")
+        except genai_errors.APITimeoutError:
+            # Raised when the per-call `timeout=GEMINI_REQUEST_TIMEOUT_SECONDS`
+            # above is hit -- see digest_engine.py's module docstring
+            # "Request-hangs-indefinitely note" (googleapis/python-genai#1893,
+            # #911). Caught BEFORE the broad genai_errors.APIError below
+            # (APITimeoutError is a subclass of APIConnectionError, itself a
+            # subclass of APIError) with its own distinct reason -- a timeout
+            # is a genuinely different situation from a rate limit or an
+            # invalid key and should never be reported as either.
+            return _chat_unavailable("Gemini API request timed out")
         except genai_errors.APIError:
             return _chat_unavailable("Gemini API error")
         except Exception:
