@@ -405,6 +405,196 @@ def _fallback_digest(stats: dict, reason: str) -> str:
     )
 
 
+def _call_gemini(
+    prompt_or_input: str,
+    system_instruction: str,
+    api_key: str,
+    max_output_tokens: int,
+    previous_interaction_id: str = None,
+) -> tuple:
+    """
+    Shared Gemini call + error-classification logic for both
+    generate_account_digest() below (a one-shot prompt: system_instruction=None,
+    no previous_interaction_id) and src/chat_engine.py's answer_account_question()
+    (a real system prompt, plus previous_interaction_id for multi-turn
+    chaining). Extracted here, in digest_engine.py, and imported BY
+    chat_engine.py -- never the reverse -- because chat_engine.py already
+    depends on digest_engine.py for GEMINI_MODEL_ID, GEMINI_REQUEST_TIMEOUT_SECONDS,
+    etc.; keeping the dependency one-directional avoids a circular import.
+
+    Why this exists: before this extraction, generate_account_digest() and
+    answer_account_question() each independently re-implemented the same
+    client construction, the same interactions.create() call shape, and the
+    same exception-handling chain -- confirmed duplication that already
+    caused near-misses (the model-ID fix and the request-timeout fix each had
+    to be hand-applied to both files separately, with real risk of the two
+    drifting out of sync). This function owns ONLY the provider call and its
+    error classification; it does NOT decide whether Gemini should be called
+    at all (_resolve_provider() still does that in each caller, before it
+    even builds a prompt/system_prompt) and does NOT do any caller-specific
+    bookkeeping -- conversation_history mutation is chat_engine.py's own
+    concern, not this function's (see answer_account_question()).
+
+    Returns a (response_text, interaction_id, failure_reason) tuple:
+    - Success: (text, the real interaction id if the response object carries
+      one else None, None).
+    - Failure (empty response, or any error class below): (None, None,
+      reason) -- `reason` is one of the exact strings both callers already
+      used before this extraction ("Gemini free-tier rate limit reached",
+      "invalid Gemini API key", "Gemini API request timed out", "Gemini API
+      error", "empty response from Gemini", "google-genai package not
+      installed") so neither caller's existing fallback-reason tests needed
+      to change.
+
+    Never raises -- both callers still guarantee "this optional feature never
+    crashes the app" by construction (every exception the SDK is documented,
+    and confirmed, to raise for this call is classified below), not by
+    re-wrapping this call in yet another try/except.
+    """
+    if genai is None:
+        # Defense-in-depth only, and what makes this function independently
+        # testable for this failure mode (patch src.digest_engine.genai
+        # directly, since that's the name this function itself reads). Both
+        # callers already check `genai is None` themselves FIRST, before ever
+        # calling this function -- that check can't move here instead,
+        # because each caller's own existing tests patch THAT module's own
+        # `genai` name (e.g. src.chat_engine.genai), which -- being a
+        # `from src.digest_engine import genai` value-import -- is an
+        # independent name binding from this module's `genai`, not an alias
+        # of it. Rebinding one doesn't rebind the other, so the "package
+        # missing" check has to stay caller-side to keep matching each
+        # existing test's patch target.
+        return None, None, "google-genai package not installed"
+    try:
+        client = genai.Client(api_key=api_key)
+        create_kwargs = {
+            "model": GEMINI_MODEL_ID,
+            "input": prompt_or_input,
+            "generation_config": {"max_output_tokens": max_output_tokens},
+            # Per-call timeout, NOT client-level http_options -- see
+            # GEMINI_REQUEST_TIMEOUT_SECONDS above (googleapis/python-genai
+            # #1893, #911): the client-level path is confirmed unreliable/
+            # broken for this SDK; this is the one confirmed to actually work.
+            "timeout": GEMINI_REQUEST_TIMEOUT_SECONDS,
+        }
+        if system_instruction is not None:
+            create_kwargs["system_instruction"] = system_instruction
+        if previous_interaction_id:
+            create_kwargs["previous_interaction_id"] = previous_interaction_id
+
+        interaction = client.interactions.create(**create_kwargs)
+        text = (interaction.output_text or "").strip()
+        if not text:
+            return None, None, "empty response from Gemini"
+        return text, getattr(interaction, "id", None), None
+    except genai_errors.APIStatusError as e:
+        # `.status_code` is a real, documented int attribute on this SDK's
+        # APIStatusError (confirmed by direct reproduction against the pinned
+        # google-genai version, not assumed -- see requirements.txt). Note
+        # Google's actual behavior here is NOT what HTTP-status convention
+        # would suggest: an invalid API key comes back as `400 BadRequestError`
+        # with `'reason': 'API_KEY_INVALID'` in the body, not 401/403 --
+        # confirmed the same way. Both are checked so a real invalid-key error
+        # is still recognized however a given deployment's Google Cloud
+        # project happens to report it.
+        status_code = getattr(e, "status_code", None)
+        message = str(e)
+        if status_code == 429 or "RESOURCE_EXHAUSTED" in message:
+            # Expected at higher account counts on the free tier -- not a bug.
+            return None, None, "Gemini free-tier rate limit reached"
+        if status_code in (401, 403) or "API_KEY_INVALID" in message:
+            return None, None, "invalid Gemini API key"
+        return None, None, "Gemini API error"
+    except genai_errors.APITimeoutError:
+        # Raised when the per-call `timeout=GEMINI_REQUEST_TIMEOUT_SECONDS`
+        # above is hit -- see the module docstring's "Request-hangs-
+        # indefinitely note" (googleapis/python-genai#1893, #911). Caught
+        # BEFORE the broad genai_errors.APIError below (APITimeoutError is a
+        # subclass of APIConnectionError, itself a subclass of APIError, so
+        # it would otherwise be swallowed by that branch's generic message)
+        # with its own distinct reason -- a timeout is a genuinely different
+        # situation from a rate limit or an invalid key and should never be
+        # reported as either.
+        return None, None, "Gemini API request timed out"
+    except genai_errors.APIError:
+        # Broad base class for everything else the SDK raises for this call
+        # (connection errors, and any future APIStatusError subclass not
+        # distinguished above) -- still a diagnosable "the SDK reported an
+        # API error", not a truly unanticipated exception. Catching the base
+        # class here (rather than only the specific subclasses above) means a
+        # future error variant this code doesn't yet know about still gets a
+        # meaningful reason instead of silently falling through to the
+        # generic catch-all below, which is exactly the bug being fixed.
+        return None, None, "Gemini API error"
+    except Exception:
+        # Last-resort safety net -- this optional feature must never crash the
+        # app -- but by this point every error shape the SDK is documented (and
+        # confirmed) to raise for this call has already been handled above, so
+        # reaching here means something genuinely unanticipated happened.
+        return None, None, "unexpected error calling Gemini"
+
+
+def _call_anthropic(
+    messages: list,
+    api_key: str,
+    max_tokens: int,
+    system: str = None,
+) -> tuple:
+    """
+    Shared Anthropic call + error-classification logic for both
+    generate_account_digest() below (system=None -- the digest never passed a
+    separate system prompt even before this extraction, just a single
+    one-shot user message) and src/chat_engine.py's answer_account_question()
+    (a real system prompt plus the full conversation_history as `messages`).
+    Mirrors _call_gemini() above exactly in spirit and in why it lives here
+    (see that function's docstring) -- extracted because the two callers'
+    Anthropic branches were otherwise identical modulo how `messages`/`system`
+    get built, which is now just a parameter each caller supplies.
+
+    Returns a (response_text, failure_reason) tuple: (text, None) on success,
+    (None, reason) on failure -- `reason` is one of the exact strings both
+    callers already used before this extraction ("invalid Anthropic API key",
+    "Anthropic API rate limited", "Anthropic API error", "could not reach the
+    Anthropic API", "empty response from the model", "anthropic package not
+    installed") so neither caller's existing fallback-reason tests needed to
+    change. The one exception is the final generic-Exception catch-all, whose
+    exact phrasing differed cosmetically between the two callers before this
+    extraction ("...generating the AI summary" vs "...answering the
+    question") -- both existing tests only assert the substring "unexpected
+    error" is present, never the full phrase, so a single shared phrase here
+    ("unexpected error calling Anthropic") satisfies both unchanged.
+
+    Never raises, for the same reason _call_gemini() doesn't.
+    """
+    if anthropic is None:
+        # Defense-in-depth only -- see _call_gemini()'s identical note on why
+        # the "package missing" check has to stay caller-side too (each
+        # caller's own existing test patches that module's own `anthropic`
+        # name, an independent binding from this module's).
+        return None, "anthropic package not installed"
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        create_kwargs = {"model": MODEL_ID, "max_tokens": max_tokens, "messages": messages}
+        if system is not None:
+            create_kwargs["system"] = system
+        response = client.with_options(timeout=REQUEST_TIMEOUT_SECONDS).messages.create(**create_kwargs)
+        text = "".join(block.text for block in response.content if block.type == "text").strip()
+        if not text:
+            return None, "empty response from the model"
+        return text, None
+    except anthropic.AuthenticationError:
+        return None, "invalid Anthropic API key"
+    except anthropic.RateLimitError:
+        return None, "Anthropic API rate limited"
+    except anthropic.APIStatusError:
+        return None, "Anthropic API error"
+    except anthropic.APIConnectionError:
+        return None, "could not reach the Anthropic API"
+    except Exception:
+        # Last-resort safety net -- this optional feature must never crash the app.
+        return None, "unexpected error calling Anthropic"
+
+
 def generate_account_digest(
     rfmt_df, clv_df, segment_summary,
     anthropic_api_key: str = None,
@@ -449,86 +639,32 @@ def generate_account_digest(
     if provider == "gemini":
         if genai is None:
             return _fallback_digest(stats, reason="google-genai package not installed")
-        try:
-            client = genai.Client(api_key=gemini_api_key)
-            interaction = client.interactions.create(
-                model=GEMINI_MODEL_ID,
-                input=prompt,
-                generation_config={"max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS},
-                # Per-call timeout, NOT client-level http_options -- see
-                # GEMINI_REQUEST_TIMEOUT_SECONDS above (googleapis/python-genai
-                # #1893, #911): the client-level path is confirmed unreliable/
-                # broken for this SDK; this is the one confirmed to actually work.
-                timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
-            )
-            text = (interaction.output_text or "").strip()
-            return text if text else _fallback_digest(stats, reason="empty response from Gemini")
-        except genai_errors.APIStatusError as e:
-            # `.status_code` is a real, documented int attribute on this SDK's
-            # APIStatusError (confirmed by direct reproduction against the pinned
-            # google-genai version, not assumed -- see requirements.txt). Note
-            # Google's actual behavior here is NOT what HTTP-status convention
-            # would suggest: an invalid API key comes back as `400 BadRequestError`
-            # with `'reason': 'API_KEY_INVALID'` in the body, not 401/403 --
-            # confirmed the same way. Both are checked so a real invalid-key error
-            # is still recognized however a given deployment's Google Cloud
-            # project happens to report it.
-            status_code = getattr(e, "status_code", None)
-            message = str(e)
-            if status_code == 429 or "RESOURCE_EXHAUSTED" in message:
-                # Expected at higher account counts on the free tier -- not a bug.
-                return _fallback_digest(stats, reason="Gemini free-tier rate limit reached")
-            if status_code in (401, 403) or "API_KEY_INVALID" in message:
-                return _fallback_digest(stats, reason="invalid Gemini API key")
-            return _fallback_digest(stats, reason="Gemini API error")
-        except genai_errors.APITimeoutError:
-            # Raised when the per-call `timeout=GEMINI_REQUEST_TIMEOUT_SECONDS`
-            # above is hit -- see the module docstring's "Request-hangs-
-            # indefinitely note" (googleapis/python-genai#1893, #911). Caught
-            # BEFORE the broad genai_errors.APIError below (APITimeoutError is a
-            # subclass of APIConnectionError, itself a subclass of APIError, so
-            # it would otherwise be swallowed by that branch's generic message)
-            # with its own distinct reason -- a timeout is a genuinely different
-            # situation from a rate limit or an invalid key and should never be
-            # reported as either.
-            return _fallback_digest(stats, reason="Gemini API request timed out")
-        except genai_errors.APIError:
-            # Broad base class for everything else the SDK raises for this call
-            # (connection errors, and any future APIStatusError subclass not
-            # distinguished above) -- still a diagnosable "the SDK reported an
-            # API error", not a truly unanticipated exception. Catching the base
-            # class here (rather than only the specific subclasses above) means a
-            # future error variant this code doesn't yet know about still gets a
-            # meaningful reason instead of silently falling through to the
-            # generic catch-all below, which is exactly the bug being fixed.
-            return _fallback_digest(stats, reason="Gemini API error")
-        except Exception:
-            # Last-resort safety net -- this optional feature must never crash the
-            # app -- but by this point every error shape the SDK is documented (and
-            # confirmed) to raise for this call has already been handled above, so
-            # reaching here means something genuinely unanticipated happened.
-            return _fallback_digest(stats, reason="unexpected error generating the AI summary via Gemini")
+        # Shared call/error-handling logic -- see _call_gemini()'s own
+        # docstring for why this is extracted (also used by
+        # src/chat_engine.py's answer_account_question()) and why the
+        # "package missing" check above stays here rather than moving inside
+        # it. The digest is a one-shot prompt: no system instruction, no
+        # multi-turn chaining, so system_instruction=None and
+        # previous_interaction_id is left at its default (None).
+        text, _interaction_id, failure_reason = _call_gemini(
+            prompt_or_input=prompt,
+            system_instruction=None,
+            api_key=gemini_api_key,
+            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+        )
+        return text if text else _fallback_digest(stats, reason=failure_reason)
 
-    # provider == "anthropic" -- unchanged from the original Anthropic-only implementation.
+    # provider == "anthropic"
     if anthropic is None:
         return _fallback_digest(stats, reason="anthropic package not installed")
-    try:
-        client = anthropic.Anthropic(api_key=anthropic_api_key)
-        response = client.with_options(timeout=REQUEST_TIMEOUT_SECONDS).messages.create(
-            model=MODEL_ID,
-            max_tokens=MAX_TOKENS,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = "".join(block.text for block in response.content if block.type == "text").strip()
-        return text if text else _fallback_digest(stats, reason="empty response from the model")
-    except anthropic.AuthenticationError:
-        return _fallback_digest(stats, reason="invalid Anthropic API key")
-    except anthropic.RateLimitError:
-        return _fallback_digest(stats, reason="Anthropic API rate limited")
-    except anthropic.APIStatusError:
-        return _fallback_digest(stats, reason="Anthropic API error")
-    except anthropic.APIConnectionError:
-        return _fallback_digest(stats, reason="could not reach the Anthropic API")
-    except Exception:
-        # Last-resort safety net -- this optional feature must never crash the app.
-        return _fallback_digest(stats, reason="unexpected error generating the AI summary")
+    # Shared call/error-handling logic -- see _call_anthropic()'s own
+    # docstring (also used by src/chat_engine.py's answer_account_question()).
+    # The digest never passed a separate system prompt even before this
+    # extraction -- just a single one-shot user message -- so system stays
+    # at its default (None).
+    text, failure_reason = _call_anthropic(
+        messages=[{"role": "user", "content": prompt}],
+        api_key=anthropic_api_key,
+        max_tokens=MAX_TOKENS,
+    )
+    return text if text else _fallback_digest(stats, reason=failure_reason)

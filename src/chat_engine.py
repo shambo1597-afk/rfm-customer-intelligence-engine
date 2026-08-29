@@ -31,26 +31,35 @@ difference in shape -- see the cost model section below.
 --- Providers, model, and error handling: reused, not re-derived ---
 
 This module deliberately does NOT define its own provider-selection logic,
-model constants, or exception-handling pattern -- it imports and reuses
-digest_engine.py's:
+model constants, provider-client construction, or exception-handling pattern
+-- it imports and reuses digest_engine.py's:
   - _resolve_provider() for the Gemini-preferred-by-default / Anthropic-
     fallback decision (identical semantics to the digest feature).
-  - GEMINI_MODEL_ID / MODEL_ID -- whatever model each provider is CURRENTLY
-    confirmed to work with there (see digest_engine.py's module docstring
-    "Model deprecation incident" note) -- never re-guessed or re-pinned here,
-    so a future model swap in digest_engine.py automatically applies to chat
-    too, and the two features can never silently drift onto different models.
-  - REQUEST_TIMEOUT_SECONDS for the Anthropic client's request timeout, and
-    GEMINI_REQUEST_TIMEOUT_SECONDS for the Gemini per-call `timeout=` kwarg on
-    interactions.create() -- see digest_engine.py's module docstring
-    "Request-hangs-indefinitely note" for why this must be the per-call kwarg
-    and never genai.Client(http_options=...) (confirmed unreliable/broken --
-    googleapis/python-genai#1893, #911).
-  - The exact same exception classes for each provider (genai_errors.
-    APIStatusError / APITimeoutError / APIError for Gemini, anthropic.
-    AuthenticationError / RateLimitError / APIStatusError / APIConnectionError
-    for Anthropic) -- the same classes digest_engine.py confirmed via direct
-    reproduction/inspection against the pinned SDK versions, not re-guessed here.
+  - _call_gemini() / _call_anthropic() for the ENTIRE provider call: client
+    construction, the interactions.create()/messages.create() call shape, and
+    the full exception-handling chain for each provider -- not just the same
+    constants/exception classes reused in parallel, the literal same
+    function bodies. This was a real, confirmed maintainability risk before
+    this consolidation existed: generate_account_digest() (digest_engine.py)
+    and answer_account_question() (below) each independently re-implemented
+    nearly identical Gemini/Anthropic call logic, and it already caused
+    near-misses -- the model-ID fix and the request-timeout fix each had to
+    be hand-applied to both files separately, with real risk of the two
+    drifting out of sync. _call_gemini()/_call_anthropic() own ONLY the
+    provider call and its error classification (see their docstrings in
+    digest_engine.py for the exact (text, ..., failure_reason) return
+    shape) -- caller-specific bookkeeping (building the system prompt,
+    finding the prior Gemini interaction id to chain from, and mutating
+    conversation_history) stays here in answer_account_question(), NOT in
+    the shared functions, since none of that is shared with the digest's
+    one-shot, non-conversational shape.
+  - GEMINI_MODEL_ID / MODEL_ID / GEMINI_REQUEST_TIMEOUT_SECONDS -- re-exported
+    here (imported but not directly called with -- _call_gemini()/
+    _call_anthropic() already read digest_engine.py's own copies internally)
+    purely so a future model or timeout swap in digest_engine.py is
+    verifiably visible from this module's own namespace too, never re-guessed
+    or re-pinned here, so the two features can never silently drift onto
+    different models.
 
 --- Multi-turn conversation ---
 
@@ -103,11 +112,11 @@ scope for this feature (see the task that introduced this module).
 from src.digest_engine import (
     anthropic,
     genai,
-    genai_errors,
     _resolve_provider,
+    _call_gemini,
+    _call_anthropic,
     MODEL_ID,
     GEMINI_MODEL_ID,
-    REQUEST_TIMEOUT_SECONDS,
     GEMINI_REQUEST_TIMEOUT_SECONDS,
 )
 
@@ -307,90 +316,53 @@ def answer_account_question(
     if provider == "gemini":
         if genai is None:
             return _chat_unavailable("google-genai package not installed")
-        try:
-            client = genai.Client(api_key=gemini_api_key)
-            create_kwargs = {
-                "model": GEMINI_MODEL_ID,
-                "input": question,
-                "system_instruction": system_prompt,
-                "generation_config": {"max_output_tokens": CHAT_MAX_OUTPUT_TOKENS},
-                # Per-call timeout, NOT client-level http_options -- see
-                # digest_engine.py's GEMINI_REQUEST_TIMEOUT_SECONDS and its
-                # "Request-hangs-indefinitely note" (googleapis/python-genai
-                # #1893, #911): the client-level path is confirmed unreliable/
-                # broken for this SDK; this is the one confirmed to actually work.
-                "timeout": GEMINI_REQUEST_TIMEOUT_SECONDS,
-            }
-            previous_interaction_id = _last_gemini_interaction_id(conversation_history)
-            if previous_interaction_id:
-                create_kwargs["previous_interaction_id"] = previous_interaction_id
+        # Shared call/error-handling logic -- see digest_engine.py's
+        # _call_gemini() docstring for why this is extracted (also used by
+        # generate_account_digest()) and why the "package missing" check
+        # above stays here rather than moving inside it. Unlike the digest,
+        # chat DOES pass a real system prompt and chains multi-turn context
+        # via previous_interaction_id -- both caller-specific concerns
+        # (computing system_prompt, finding the prior interaction id,
+        # appending to conversation_history) stay here; _call_gemini() only
+        # owns the call itself and its error classification.
+        previous_interaction_id = _last_gemini_interaction_id(conversation_history)
+        text, interaction_id, failure_reason = _call_gemini(
+            prompt_or_input=question,
+            system_instruction=system_prompt,
+            api_key=gemini_api_key,
+            max_output_tokens=CHAT_MAX_OUTPUT_TOKENS,
+            previous_interaction_id=previous_interaction_id,
+        )
+        if failure_reason:
+            return _chat_unavailable(failure_reason)
 
-            interaction = client.interactions.create(**create_kwargs)
-            text = (interaction.output_text or "").strip()
-            if not text:
-                return _chat_unavailable("empty response from Gemini")
-
-            conversation_history.append({"role": "user", "content": question})
-            conversation_history.append({
-                "role": "assistant",
-                "content": text,
-                "gemini_interaction_id": interaction.id,
-            })
-            return text
-        except genai_errors.APIStatusError as e:
-            # Same distinctions as digest_engine.py's Gemini branch, reusing
-            # the same confirmed attributes/behavior -- see that module's
-            # docstring for the "Error handling note" this mirrors exactly.
-            status_code = getattr(e, "status_code", None)
-            message = str(e)
-            if status_code == 429 or "RESOURCE_EXHAUSTED" in message:
-                return _chat_unavailable("Gemini free-tier rate limit reached")
-            if status_code in (401, 403) or "API_KEY_INVALID" in message:
-                return _chat_unavailable("invalid Gemini API key")
-            return _chat_unavailable("Gemini API error")
-        except genai_errors.APITimeoutError:
-            # Raised when the per-call `timeout=GEMINI_REQUEST_TIMEOUT_SECONDS`
-            # above is hit -- see digest_engine.py's module docstring
-            # "Request-hangs-indefinitely note" (googleapis/python-genai#1893,
-            # #911). Caught BEFORE the broad genai_errors.APIError below
-            # (APITimeoutError is a subclass of APIConnectionError, itself a
-            # subclass of APIError) with its own distinct reason -- a timeout
-            # is a genuinely different situation from a rate limit or an
-            # invalid key and should never be reported as either.
-            return _chat_unavailable("Gemini API request timed out")
-        except genai_errors.APIError:
-            return _chat_unavailable("Gemini API error")
-        except Exception:
-            return _chat_unavailable("unexpected error answering the question via Gemini")
+        conversation_history.append({"role": "user", "content": question})
+        conversation_history.append({
+            "role": "assistant",
+            "content": text,
+            "gemini_interaction_id": interaction_id,
+        })
+        return text
 
     # provider == "anthropic"
     if anthropic is None:
         return _chat_unavailable("anthropic package not installed")
-    try:
-        client = anthropic.Anthropic(api_key=anthropic_api_key)
-        messages = _anthropic_messages_from_history(conversation_history) + [
-            {"role": "user", "content": question}
-        ]
-        response = client.with_options(timeout=REQUEST_TIMEOUT_SECONDS).messages.create(
-            model=MODEL_ID,
-            max_tokens=CHAT_MAX_OUTPUT_TOKENS,
-            system=system_prompt,
-            messages=messages,
-        )
-        text = "".join(block.text for block in response.content if block.type == "text").strip()
-        if not text:
-            return _chat_unavailable("empty response from the model")
+    # Shared call/error-handling logic -- see digest_engine.py's
+    # _call_anthropic() docstring (also used by generate_account_digest()).
+    # Building `messages` from conversation_history plus this turn's question
+    # is chat-specific and stays here, same as the Gemini branch above.
+    messages = _anthropic_messages_from_history(conversation_history) + [
+        {"role": "user", "content": question}
+    ]
+    text, failure_reason = _call_anthropic(
+        messages=messages,
+        api_key=anthropic_api_key,
+        max_tokens=CHAT_MAX_OUTPUT_TOKENS,
+        system=system_prompt,
+    )
+    if failure_reason:
+        return _chat_unavailable(failure_reason)
 
-        conversation_history.append({"role": "user", "content": question})
-        conversation_history.append({"role": "assistant", "content": text})
-        return text
-    except anthropic.AuthenticationError:
-        return _chat_unavailable("invalid Anthropic API key")
-    except anthropic.RateLimitError:
-        return _chat_unavailable("Anthropic API rate limited")
-    except anthropic.APIStatusError:
-        return _chat_unavailable("Anthropic API error")
-    except anthropic.APIConnectionError:
-        return _chat_unavailable("could not reach the Anthropic API")
-    except Exception:
-        return _chat_unavailable("unexpected error answering the question")
+    conversation_history.append({"role": "user", "content": question})
+    conversation_history.append({"role": "assistant", "content": text})
+    return text

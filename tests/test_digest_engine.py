@@ -24,8 +24,11 @@ from src.digest_engine import (
     _build_aggregate_stats,
     _build_prompt,
     _fallback_digest,
+    _call_gemini,
+    _call_anthropic,
     MODEL_ID,
     MAX_TOKENS,
+    REQUEST_TIMEOUT_SECONDS,
     GEMINI_MODEL_ID,
     GEMINI_MAX_OUTPUT_TOKENS,
     GEMINI_REQUEST_TIMEOUT_SECONDS,
@@ -542,6 +545,353 @@ class TestGeminiFailuresDegradeGracefully:
 
         assert "[Template Summary" in result
         assert "unexpected error" in result
+
+
+class TestCallGeminiInIsolation:
+    """
+    Direct, isolated coverage of _call_gemini() -- the shared Gemini call/
+    error-handling logic extracted (Issue 2, the deduplication hardening
+    pass) so it has its own test coverage rather than only being exercised
+    indirectly through generate_account_digest() and
+    src/chat_engine.py's answer_account_question(). Every test here calls
+    _call_gemini() directly and asserts on its (text, interaction_id,
+    failure_reason) return tuple -- no _fallback_digest()/_chat_unavailable()
+    wrapping involved, since that's each caller's own concern, not this
+    function's.
+    """
+
+    def test_success_returns_text_interaction_id_and_no_failure_reason(self):
+        mock_interaction = types.SimpleNamespace(output_text="A generated answer.", id="interaction-abc")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text == "A generated answer."
+        assert interaction_id == "interaction-abc"
+        assert failure_reason is None
+
+    def test_success_when_response_has_no_id_attribute_returns_none_id_not_a_crash(self):
+        # digest_engine.py's own existing Gemini-success tests mock
+        # types.SimpleNamespace(output_text=...) with NO `id` field -- this
+        # confirms _call_gemini() tolerates that (getattr with a default)
+        # rather than raising AttributeError, which is what a naive
+        # `interaction.id` would have done.
+        mock_interaction = types.SimpleNamespace(output_text="An answer.")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text == "An answer."
+        assert interaction_id is None
+        assert failure_reason is None
+
+    def test_system_instruction_none_omits_the_kwarg_entirely(self):
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            _call_gemini("a prompt", None, "fake-gemini-key", 300)
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert "system_instruction" not in kwargs
+
+    def test_system_instruction_when_given_is_passed_through(self):
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            _call_gemini("a question", "a system prompt", "fake-gemini-key", 300)
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert kwargs["system_instruction"] == "a system prompt"
+
+    def test_previous_interaction_id_none_omits_the_kwarg_entirely(self):
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i1")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            _call_gemini("a prompt", None, "fake-gemini-key", 300, previous_interaction_id=None)
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert "previous_interaction_id" not in kwargs
+
+    def test_previous_interaction_id_when_given_is_passed_through(self):
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i2")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            _call_gemini("a prompt", None, "fake-gemini-key", 300, previous_interaction_id="prior-id")
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert kwargs["previous_interaction_id"] == "prior-id"
+
+    def test_max_output_tokens_and_timeout_are_always_passed_through(self):
+        mock_interaction = types.SimpleNamespace(output_text="An answer.", id="i3")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            _call_gemini("a prompt", None, "fake-gemini-key", 123)
+
+        _, kwargs = mock_client.interactions.create.call_args
+        assert kwargs["generation_config"]["max_output_tokens"] == 123
+        assert kwargs["timeout"] == GEMINI_REQUEST_TIMEOUT_SECONDS
+
+    def test_empty_output_text_returns_the_documented_failure_reason(self):
+        mock_interaction = types.SimpleNamespace(output_text="   ", id="i4")
+        mock_client = MagicMock()
+        mock_client.interactions.create.return_value = mock_interaction
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None
+        assert interaction_id is None
+        assert failure_reason == "empty response from Gemini"
+
+    def test_package_missing_returns_the_documented_failure_reason(self):
+        # Patches src.digest_engine.genai directly (the name _call_gemini()
+        # itself reads) -- see _call_gemini()'s own docstring for why this
+        # check can't be caller-agnostic across modules.
+        with patch("src.digest_engine.genai", None):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None
+        assert interaction_id is None
+        assert failure_reason == "google-genai package not installed"
+
+    def test_rate_limit_returns_the_documented_failure_reason(self):
+        exc = _make_gemini_api_error(429, "quota exceeded", reason="RESOURCE_EXHAUSTED")
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert failure_reason == "Gemini free-tier rate limit reached"
+
+    @pytest.mark.parametrize("status_code", [400, 401, 403])
+    def test_invalid_key_shapes_return_the_documented_failure_reason(self, status_code):
+        exc = _make_gemini_api_error(
+            status_code, "bad credentials",
+            reason="UNAUTHENTICATED" if status_code != 400 else "INVALID_ARGUMENT",
+            body={"error": {"code": status_code, "message": "API key not valid.",
+                             "details": [{"reason": "API_KEY_INVALID"}]}} if status_code == 400 else None,
+        )
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert failure_reason == "invalid Gemini API key"
+
+    def test_other_api_status_error_returns_the_generic_failure_reason(self):
+        exc = _make_gemini_api_error(404, "not found")
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert failure_reason == "Gemini API error"
+
+    def test_timeout_returns_its_own_distinct_failure_reason(self):
+        exc = genai_errors.APITimeoutError(request=httpx.Request(
+            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        ))
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert failure_reason == "Gemini API request timed out"
+
+    def test_generic_connection_error_falls_back_via_the_broad_apierror_branch(self):
+        exc = genai_errors.APIConnectionError(message="connection failed", request=httpx.Request(
+            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        ))
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert failure_reason == "Gemini API error"
+
+    def test_unexpected_exception_returns_a_reason_containing_unexpected_error(self):
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = RuntimeError("boom")
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            text, interaction_id, failure_reason = _call_gemini(
+                "a prompt", None, "fake-gemini-key", 300
+            )
+
+        assert text is None and interaction_id is None
+        assert "unexpected error" in failure_reason
+        assert "Gemini" in failure_reason
+
+
+class TestCallAnthropicInIsolation:
+    """
+    Direct, isolated coverage of _call_anthropic() -- the shared Anthropic
+    call/error-handling logic extracted alongside _call_gemini() above (same
+    Issue 2 deduplication rationale, see _call_anthropic()'s own docstring in
+    src/digest_engine.py). Every test here calls _call_anthropic() directly
+    and asserts on its (text, failure_reason) return tuple.
+    """
+
+    def _mock_response(self, text="A generated answer."):
+        block = types.SimpleNamespace(type="text", text=text)
+        return types.SimpleNamespace(content=[block])
+
+    def test_success_returns_text_and_no_failure_reason(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = self._mock_response()
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            text, failure_reason = _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="sk-ant-fake-key",
+                max_tokens=300,
+            )
+
+        assert text == "A generated answer."
+        assert failure_reason is None
+
+    def test_system_none_omits_the_kwarg_entirely(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = self._mock_response()
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            _call_anthropic(messages=[{"role": "user", "content": "hi"}], api_key="sk-ant-fake-key", max_tokens=300)
+
+        _, kwargs = mock_client.with_options.return_value.messages.create.call_args
+        assert "system" not in kwargs
+
+    def test_system_when_given_is_passed_through(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = self._mock_response()
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}],
+                api_key="sk-ant-fake-key",
+                max_tokens=300,
+                system="a system prompt",
+            )
+
+        _, kwargs = mock_client.with_options.return_value.messages.create.call_args
+        assert kwargs["system"] == "a system prompt"
+
+    def test_messages_model_max_tokens_and_timeout_are_passed_through(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = self._mock_response()
+        messages = [{"role": "user", "content": "hi"}]
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            _call_anthropic(messages=messages, api_key="sk-ant-fake-key", max_tokens=123)
+
+        mock_client.with_options.assert_called_once_with(timeout=REQUEST_TIMEOUT_SECONDS)
+        _, kwargs = mock_client.with_options.return_value.messages.create.call_args
+        assert kwargs["model"] == MODEL_ID
+        assert kwargs["max_tokens"] == 123
+        assert kwargs["messages"] == messages
+
+    def test_empty_response_returns_the_documented_failure_reason(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = self._mock_response(text="   ")
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            text, failure_reason = _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}], api_key="sk-ant-fake-key", max_tokens=300
+            )
+
+        assert text is None
+        assert failure_reason == "empty response from the model"
+
+    def test_package_missing_returns_the_documented_failure_reason(self):
+        # Patches src.digest_engine.anthropic directly (the name
+        # _call_anthropic() itself reads) -- see its docstring for why this
+        # check can't be caller-agnostic across modules.
+        with patch("src.digest_engine.anthropic", None):
+            text, failure_reason = _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}], api_key="sk-ant-fake-key", max_tokens=300
+            )
+
+        assert text is None
+        assert failure_reason == "anthropic package not installed"
+
+    @pytest.mark.parametrize("exception_name,expected_reason", [
+        ("AuthenticationError", "invalid Anthropic API key"),
+        ("RateLimitError", "Anthropic API rate limited"),
+        ("APIStatusError", "Anthropic API error"),
+        ("APIConnectionError", "could not reach the Anthropic API"),
+    ])
+    def test_each_typed_exception_returns_its_own_documented_failure_reason(
+        self, exception_name, expected_reason
+    ):
+        import anthropic as real_anthropic
+
+        exc_cls = getattr(real_anthropic, exception_name)
+        exc_instance = exc_cls.__new__(exc_cls)
+
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.side_effect = exc_instance
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            text, failure_reason = _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}], api_key="sk-ant-fake-key", max_tokens=300
+            )
+
+        assert text is None
+        assert failure_reason == expected_reason
+
+    def test_unexpected_exception_returns_a_reason_containing_unexpected_error(self):
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.side_effect = RuntimeError("boom")
+
+        with patch("src.digest_engine.anthropic.Anthropic", return_value=mock_client):
+            text, failure_reason = _call_anthropic(
+                messages=[{"role": "user", "content": "hi"}], api_key="sk-ant-fake-key", max_tokens=300
+            )
+
+        assert text is None
+        assert "unexpected error" in failure_reason
+        assert "Anthropic" in failure_reason
 
 
 class TestTargetConfiguration:
