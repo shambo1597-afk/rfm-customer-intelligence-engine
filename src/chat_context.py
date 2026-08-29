@@ -103,6 +103,32 @@ stays scoped to exactly these two tables, not the full customer base).
   in it is pulled from an already-written, already-verified README section --
   see the source-section comment next to each fact in
   build_methodology_context() below. Nothing here is invented.
+- Segment marketing playbooks (CHAT_SEGMENT_PLAYBOOKS): static content, one
+  Primary Objective / Best Channels / Recommended Promotion entry per segment,
+  transcribed verbatim from README's "Enterprise 7-Segment Taxonomy &
+  Marketing Playbooks" table -- same "already-verified README section, not
+  invented here" treatment as the methodology content above. Added so the
+  chatbot can answer "what should I do about this customer/segment" with a
+  concrete, segment-appropriate recommendation instead of refusing for lack
+  of any recommended-action content in the blob (a real gap found in live
+  testing: the model correctly named specific at-risk customers, then
+  correctly refused to recommend an action, because no such content existed
+  in the context blob at the time). NOTE: this is intentionally a
+  differently-named, differently-shaped constant from src/rfm_engine.py's own
+  module-level SEGMENT_PLAYBOOKS (a richer title/icon/profile/campaign-copy
+  structure that feeds the What-If Campaign ROI Simulator's Campaign Copy
+  Blueprint, not this chat context) -- reusing that name here would collide
+  with an already-existing, differently-scoped constant, and reusing that
+  dict's content would couple two independently-reviewed features together.
+  This module's copy is transcribed fresh from README, the task's named
+  source of truth, and was cross-checked row-by-row against
+  rfm_engine.SEGMENT_PLAYBOOKS while writing it: that dict's wording has
+  drifted from README's in a few places (e.g. its Hibernating "objective" says
+  "Low-cost reactivation", not README's "Low-cost liquidation" -- a genuinely
+  different concept) and three of its "promo_type" fields omit the specific
+  dollar/percent figures README states (present elsewhere in that dict's
+  campaign_template text, but not in promo_type itself). CHAT_SEGMENT_PLAYBOOKS
+  below matches README, not rfm_engine.SEGMENT_PLAYBOOKS, on every field.
 """
 
 from src.digest_engine import _build_aggregate_stats
@@ -190,6 +216,54 @@ def _growth_target_rows_for_chat(growth_df, max_rows: int = GROWTH_TARGET_CHAT_R
         }
         for _, row in growth_df.head(max_rows).iterrows()
     ]
+
+
+# Static, module-level segment marketing-playbook content -- not computed from
+# any DataFrame, same treatment as build_methodology_context() below. Each
+# segment's primary_objective / best_channels / recommended_promotion is
+# transcribed verbatim (prose paraphrased for prompt compactness only, meaning
+# and every figure unchanged) from README's "## Enterprise 7-Segment Taxonomy
+# & Marketing Playbooks" table -- cross-checked row-by-row against that table
+# while writing this, not recalled from memory. See module docstring's "What's
+# in the blob" section above for why this is a distinctly-named constant from
+# src/rfm_engine.py's own SEGMENT_PLAYBOOKS, and how the two differ.
+CHAT_SEGMENT_PLAYBOOKS = {
+    "Champions": {
+        "primary_objective": "Reward loyalty, elevate advocacy, offer exclusive drops.",
+        "best_channels": "VIP Concierge, Direct Email",
+        "recommended_promotion": "Early access, concierge care, loyalty token multipliers.",
+    },
+    "Loyalists": {
+        "primary_objective": "Increase basket size, cross-sell adjacent categories.",
+        "best_channels": "Automated Sequences, SMS",
+        "recommended_promotion": "Curated bundles, volume discounts, referral perks.",
+    },
+    "Potential Growth": {
+        "primary_objective": "Build repurchase cadence, educate on full catalog.",
+        "best_channels": "Educational Email Drips, On-Site",
+        "recommended_promotion": "Next-purchase vouchers ($25 credit), category trials.",
+    },
+    "At-Risk VIPs": {
+        "primary_objective": "Urgent intervention to reignite brand affinity.",
+        "best_channels": "Win-Back Email, SMS, Retargeting",
+        "recommended_promotion": "20–25% reactivation coupon, free warranty extension.",
+    },
+    "Can't Lose Them": {
+        "primary_objective": "High-touch win-back, executive outreach, qualitative survey.",
+        "best_channels": "Executive Email, Phone Concierge",
+        "recommended_promotion": "Aggressive 30% discount, complimentary VIP gift.",
+    },
+    "Hibernating": {
+        "primary_objective": "Low-cost liquidation or email deliverability hygiene.",
+        "best_channels": "Automated Re-permission, Social",
+        "recommended_promotion": "Seasonal clearance blasts (up to 40% off), opt-out sunset.",
+    },
+    "New Customers": {
+        "primary_objective": "Onboard smoothly, guide product usage, secure 2nd order.",
+        "best_channels": "Onboarding Email Series, SMS",
+        "recommended_promotion": "Welcome gift ($15 off within 21 days), quick-start guide.",
+    },
+}
 
 
 def build_methodology_context() -> dict:
@@ -367,7 +441,8 @@ def build_account_context_blob(
     carry CustomerID-level detail by informed decision, scoped to those two
     tables only):
       aggregate_stats, segment_breakdown, churn_watchlist, growth_targets,
-      cohort_retention_by_month, segment_cluster_crosstab, methodology.
+      cohort_retention_by_month, segment_cluster_crosstab, methodology,
+      segment_playbooks.
     """
     aggregate_stats = _build_aggregate_stats(rfmt_df, clv_df, segment_summary)
 
@@ -427,6 +502,7 @@ def build_account_context_blob(
         "cohort_retention_by_month": cohort_retention_by_month,
         "segment_cluster_crosstab": segment_cluster_crosstab,
         "methodology": build_methodology_context(),
+        "segment_playbooks": CHAT_SEGMENT_PLAYBOOKS,
     }
 
 
@@ -451,6 +527,12 @@ def build_context_text(blob: dict) -> str:
         f"avg tenure {seg['avg_tenure_days']:.0f} days"
         for seg in blob["segment_breakdown"]
     ) or "- (no segment data available)"
+
+    playbook_lines = "\n".join(
+        f"- {segment}: Objective -- {p['primary_objective']} Best channels -- {p['best_channels']} "
+        f"Recommended promotion -- {p['recommended_promotion']}"
+        for segment, p in blob["segment_playbooks"].items()
+    ) or "- (no segment playbook data available)"
 
     watchlist = blob["churn_watchlist"]
     watchlist_composition = ", ".join(
@@ -530,6 +612,10 @@ def build_context_text(blob: dict) -> str:
         f"Customers at high churn risk: {stats['pct_at_risk']:.1f}%\n\n"
         "SEGMENT BREAKDOWN (RFM-T rule-based taxonomy)\n"
         f"{segment_lines}\n\n"
+        "SEGMENT PLAYBOOKS (recommended actions -- use this to answer 'what should I do "
+        "about this customer/segment' by cross-referencing the customer's Segment against "
+        "the matching row below)\n"
+        f"{playbook_lines}\n\n"
         "CHURN WATCHLIST (high-spend accounts in critical P(Alive) decay)\n"
         f"Count: {watchlist['count']:,}\n"
         f"Total value at risk: ${watchlist['total_value']:,.2f}\n"
