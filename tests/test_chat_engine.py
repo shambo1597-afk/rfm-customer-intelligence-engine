@@ -16,6 +16,7 @@ The real-model behavior itself was verified manually against a live API key
 per this task's verification step (see the PR/commit description), not here.
 """
 
+import re
 import types
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ from google.genai._gaos.lib import compat_errors as genai_errors
 from src.chat_context import build_account_context_blob, build_context_text
 from src.chat_engine import (
     answer_account_question,
+    escape_markdown_dollar_signs,
     CHAT_MAX_OUTPUT_TOKENS,
     CHAT_SYSTEM_PROMPT_TEMPLATE,
     _chat_unavailable,
@@ -112,6 +114,104 @@ class TestSystemPromptInstructsScopeLimitation:
         prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob="dummy context")
         assert "does NOT appear" in prompt
         assert "not every customer on the account" in prompt.lower() or "not in the current watchlist" in prompt.lower()
+
+    def test_system_prompt_instructs_avoiding_latex_and_math_notation(self):
+        # This is the supplementary risk-reduction half of the LaTeX-rendering
+        # bug fix (see escape_markdown_dollar_signs()'s docstring for the
+        # actual, guaranteed fix) -- reduces how often the model's own
+        # phrasing triggers Streamlit's inline-math parsing, though it can't
+        # eliminate the risk on its own (the model doesn't control the
+        # renderer, and two independent dollar amounts in one answer would
+        # still form an accidental math-delimiter pair regardless of intent).
+        prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(context_blob="dummy context")
+        assert "latex" in prompt.lower()
+        assert "P(Alive)" in prompt
+        assert "$1,234.56" in prompt
+
+
+class TestLatexRenderingBugFix:
+    """
+    Regression coverage for the LaTeX-rendering bug: a Chat Q&A answer
+    containing a dollar amount and "P(Alive)" rendered as
+    "716,276.02andanaverageP(Alive)$ of 10.1%" in Streamlit's markdown output
+    (confirmed via a real screenshot). Root cause and the actual fix are
+    documented in escape_markdown_dollar_signs()'s own docstring.
+    """
+
+    def test_every_bare_dollar_sign_is_escaped(self):
+        raw = "Total historical value: $716,276.02 and an average P(Alive) of 10.1%"
+        escaped = escape_markdown_dollar_signs(raw)
+        assert "\\$716,276.02" in escaped
+        # No bare, unescaped '$' should survive anywhere in the output.
+        assert re.search(r"(?<!\\)\$", escaped) is None
+
+    def test_reproduces_the_exact_screenshotted_failure_pattern_and_fixes_it(self):
+        # Two dollar amounts (or, as here, a dollar amount plus the model's
+        # own habit of wrapping "P(Alive)" in $ signs) form an accidental
+        # matched pair that remark-math treats as one inline-math span -- the
+        # exact mechanism behind the screenshotted bug. Confirms escaping
+        # neutralizes it regardless of how many bare '$' characters are present.
+        raw = "a total historical value of $716,276.02 and an average $P(Alive)$ of 10.1%"
+        escaped = escape_markdown_dollar_signs(raw)
+        assert re.search(r"(?<!\\)\$", escaped) is None
+        assert escaped.count("\\$") == raw.count("$")
+
+    def test_text_with_no_dollar_signs_is_unchanged(self):
+        raw = "This account has 450 customers across 7 segments."
+        assert escape_markdown_dollar_signs(raw) == raw
+
+    def test_already_escaped_dollar_sign_is_not_double_escaped_incorrectly(self):
+        # Not an expected real-world input (the model is instructed not to
+        # produce LaTeX at all), but confirms the function is a pure,
+        # predictable character-level transform rather than something that
+        # could mangle already-backslashed text in a surprising way.
+        raw = "literal backslash-dollar: \\$5"
+        escaped = escape_markdown_dollar_signs(raw)
+        # Every '$' (regardless of what precedes it) gets its own new
+        # backslash prepended -- simple, unconditional, and idempotent-safe
+        # in the sense that no unescaped '$' can ever remain.
+        assert re.search(r"(?<!\\)\$", escaped) is None
+
+    def test_escaped_text_survives_streamlits_own_markdown_element_construction(self):
+        """
+        Real regression test through Streamlit's own markdown element
+        construction (streamlit.testing.v1.AppTest) -- not a mock -- confirming
+        the escaped text reaches st.markdown() with its backslash-escapes
+        intact end to end. Streamlit's Python-side clean_text() only dedents/
+        strips (confirmed by reading streamlit/string_util.py), so this proves
+        escaping survives that path unmodified.
+
+        What this test CANNOT verify (no headless browser/JS engine available
+        in this environment): that the browser's remark-math parser actually
+        renders a backslash-escaped '$' as a literal character rather than a
+        math delimiter. That half is standard CommonMark punctuation-escape
+        behavior (confirmed by reading the CommonMark spec and locating
+        remark-math's singleDollarTextMath option, defaulted true, in the
+        installed Streamlit package's own static JS bundle -- see
+        escape_markdown_dollar_signs()'s docstring), not re-verified by an
+        actual browser here.
+        """
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_function(_latex_bug_probe_script).run()
+        rendered = at.markdown[0].value
+        assert "\\$716,276.02" in rendered
+        assert re.search(r"(?<!\\)\$", rendered) is None
+
+
+def _latex_bug_probe_script():
+    """Standalone Streamlit script for TestLatexRenderingBugFix's AppTest
+    regression test -- must be a real, source-file-backed top-level function
+    (streamlit.testing.v1.AppTest.from_function reads it via
+    inspect.getsourcelines(), which fails on anything not backed by a real
+    file, e.g. code executed via exec()/-c), so this lives at module level
+    rather than nested inside the test method."""
+    import streamlit as st
+
+    from src.chat_engine import escape_markdown_dollar_signs
+
+    raw = "Total historical value: $716,276.02 and an average P(Alive) of 10.1%"
+    st.markdown(escape_markdown_dollar_signs(raw))
 
 
 class TestFallbackPathNoKeys:

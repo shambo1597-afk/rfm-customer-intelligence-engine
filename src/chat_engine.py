@@ -119,6 +119,58 @@ CHAT_MAX_OUTPUT_TOKENS = 500
 
 _UNAVAILABLE_PREFIX = "**[Chat temporarily unavailable"
 
+
+def escape_markdown_dollar_signs(text: str) -> str:
+    r"""
+    Escapes every literal '$' in `text` as '\$' so Streamlit's markdown
+    renderer never interprets it as an inline-LaTeX delimiter.
+
+    THIS is the actual fix for the LaTeX-rendering bug (confirmed via a real
+    screenshot: an answer containing a dollar amount and "P(Alive)" rendered
+    as "716,276.02andanaverageP(Alive)$ of 10.1%" in the Streamlit UI). Root
+    cause, confirmed by reading the installed Streamlit package's own code,
+    not assumed: `st.markdown()`'s body is passed through unmodified (its
+    `clean_text()` helper -- streamlit/string_util.py -- only dedents/strips
+    whitespace, never touches '$'), and Streamlit's client-side markdown
+    renderer is built on remark-math with `singleDollarTextMath` enabled by
+    default (confirmed by locating that exact option, defaulted true, inside
+    the installed package's static JS bundle,
+    streamlit/static/static/js/StreamlitMarkdown.*.js) -- so ANY pair of bare
+    '$' characters anywhere in the rendered text gets treated as an opening/
+    closing inline-math span, with ordinary spaces inside that span collapsed
+    by the math renderer. Two dollar amounts in the same answer (or one
+    dollar amount plus the model wrapping "P(Alive)" in $ signs out of its
+    own math-notation habit, as it evidently did in the screenshotted case)
+    is enough to accidentally form such a pair -- this is a structural risk
+    of ANY answer containing more than one bare '$', not a rare edge case.
+
+    Backslash-escaping '$' is a standard CommonMark punctuation escape ('$'
+    is one of the ASCII punctuation characters eligible for it per the
+    CommonMark spec) that remark/micromark (what Streamlit's renderer is
+    built on) honors as a literal character, never as a math delimiter --
+    this is what actually neutralizes the bug, independent of anything the
+    model itself writes. There is no Streamlit-side parameter to disable
+    single-dollar math interpretation from the Python API (`st.markdown()`
+    has no such kwarg -- confirmed by reading its signature/docstring in the
+    installed package; `singleDollarTextMath` is only reachable from the
+    frontend bundle, not exposed to callers), so escaping the text itself
+    before it reaches `st.markdown()` is the only fix available at this
+    layer. Applied unconditionally, not just "outside code blocks" -- this
+    chat feature is a business data assistant, not a coding tool, so there is
+    no legitimate use case here for an unescaped '$' (real LaTeX/currency-as-
+    math) to preserve.
+
+    CHAT_SYSTEM_PROMPT_TEMPLATE below separately instructs the model not to
+    use LaTeX/math notation -- that reduces how often this situation even
+    arises, but does NOT by itself fix the bug (the model doesn't control
+    Streamlit's renderer, and a well-behaved model writing two independent
+    dollar amounts in one answer would still trigger it). This function is
+    the actual, guaranteed fix; the prompt instruction is a supplementary
+    risk-reduction measure only.
+    """
+    return text.replace("$", "\\$")
+
+
 CHAT_SYSTEM_PROMPT_TEMPLATE = (
     "You are a data assistant answering questions about ONE business account's "
     "customer intelligence dashboard, for the analyst reviewing it. Answer ONLY "
@@ -160,6 +212,14 @@ CHAT_SYSTEM_PROMPT_TEMPLATE = (
     "segment) as that section itself is -- never soften or spin a documented "
     "limitation into something more flattering than what the context data "
     "actually says.\n\n"
+    "Formatting: never use LaTeX or math notation of any kind -- do not wrap "
+    "anything in single or double dollar signs (e.g. do not write \"$P(Alive)$\" "
+    "or \"$$...$$\") and do not use \\frac, \\sum, or similar math markup. "
+    "Write currency plainly, e.g. \"$1,234.56\", and write \"P(Alive)\" as "
+    "plain text with no surrounding dollar signs or other math delimiters. "
+    "This is a business data assistant, not a math tool -- there is never a "
+    "legitimate reason to use math notation here, and doing so breaks how "
+    "your answer renders for the analyst.\n\n"
     "CONTEXT DATA:\n{context_blob}\n"
 )
 
