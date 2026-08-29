@@ -10,8 +10,9 @@ precisely because it must NOT construct a client or attempt any network call at 
 import types
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from google.genai import errors as genai_errors
+from google.genai._gaos.lib import compat_errors as genai_errors
 
 from src.rfm_engine import get_segment_kpi_summary
 from src.digest_engine import (
@@ -33,6 +34,34 @@ from src.digest_engine import (
 @pytest.fixture(scope="module")
 def segment_summary(clv_df):
     return get_segment_kpi_summary(clv_df)
+
+
+def _make_gemini_api_error(status_code: int, message: str, reason: str = "", body: dict = None):
+    """
+    Builds a real `genai_errors.APIStatusError` subclass instance via the exact
+    factory (`APIError.generate`) the installed google-genai SDK itself uses to
+    turn an HTTP response into an exception -- rather than hand-picking a
+    subclass in the test, this reproduces the SDK's real status_code -> class
+    dispatch (confirmed by direct reproduction against a live invalid-key call;
+    see src/digest_engine.py's module docstring), so these tests exercise the
+    actual exception hierarchy `client.interactions.create()` raises, not a
+    guess at it.
+
+    `body` defaults to a simple `{code, message, status}` error envelope; pass
+    it explicitly to reproduce a more specific real response shape (e.g. the
+    invalid-key error's nested `details` list -- see
+    test_invalid_api_key_returns_400_bad_request_and_still_falls_back_with_invalid_key_reason).
+    """
+    request = httpx.Request("POST", "https://generativelanguage.googleapis.com/v1beta/interactions")
+    response = httpx.Response(status_code=status_code, request=request)
+    if body is None:
+        body = {"error": {"code": status_code, "message": message, "status": reason}}
+    return genai_errors.APIError.generate(
+        status_code=status_code,
+        body=body,
+        message=f"Error code: {status_code} - [{body}]",
+        response=response,
+    )
 
 
 class TestNamedConstants:
@@ -333,10 +362,8 @@ class TestGeminiFailuresDegradeGracefully:
     def test_rate_limit_429_resource_exhausted_falls_back_with_specific_reason(self, rfmt_df, clv_df, segment_summary):
         # This is the documented, expected-at-scale free-tier ceiling
         # (ai.google.dev/gemini-api/docs/rate-limits) -- must be caught, not raised.
-        exc = genai_errors.ClientError(
-            code=429,
-            response_json={"error": {"message": "quota exceeded", "status": "RESOURCE_EXHAUSTED"}},
-        )
+        exc = _make_gemini_api_error(429, "quota exceeded", reason="RESOURCE_EXHAUSTED")
+        assert isinstance(exc, genai_errors.RateLimitError)  # sanity check on the helper itself
         mock_client = MagicMock()
         mock_client.interactions.create.side_effect = exc
 
@@ -344,14 +371,51 @@ class TestGeminiFailuresDegradeGracefully:
             result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
 
         assert "[Template Summary" in result
-        assert "rate limit" in result.lower()
+        assert "Gemini free-tier rate limit reached" in result
+
+    def test_invalid_api_key_returns_400_bad_request_and_still_falls_back_with_invalid_key_reason(
+        self, rfmt_df, clv_df, segment_summary
+    ):
+        # This is the REAL shape Google's API returns for a bad key (confirmed by
+        # reproducing a live invalid-key call against the pinned SDK version) --
+        # HTTP 400 BadRequestError, with the outer body 'status' as
+        # 'INVALID_ARGUMENT' (NOT a distinguishing signal on its own -- many
+        # non-key 400s share it) and the specific 'API_KEY_INVALID' reason
+        # nested in 'details', exactly as Google's real response embeds it. NOT
+        # 401/403 as HTTP convention might suggest. This is the exact real-world
+        # response shape the bug this fix addresses was silently mis-handling.
+        real_invalid_key_body = {
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "API_KEY_INVALID",
+                        "domain": "googleapis.com",
+                        "metadata": {"service": "generativelanguage.googleapis.com"},
+                    },
+                ],
+            }
+        }
+        exc = _make_gemini_api_error(
+            400, "API key not valid. Please pass a valid API key.", body=real_invalid_key_body
+        )
+        assert isinstance(exc, genai_errors.BadRequestError)  # sanity check on the helper itself
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="bad-key")
+
+        assert "[Template Summary" in result
+        assert "invalid Gemini API key" in result
+        assert "unexpected error" not in result
 
     @pytest.mark.parametrize("code", [401, 403])
     def test_auth_errors_fall_back_with_invalid_key_reason(self, rfmt_df, clv_df, segment_summary, code):
-        exc = genai_errors.ClientError(
-            code=code,
-            response_json={"error": {"message": "bad credentials", "status": "UNAUTHENTICATED"}},
-        )
+        exc = _make_gemini_api_error(code, "bad credentials", reason="UNAUTHENTICATED")
         mock_client = MagicMock()
         mock_client.interactions.create.side_effect = exc
 
@@ -361,8 +425,26 @@ class TestGeminiFailuresDegradeGracefully:
         assert "[Template Summary" in result
         assert "invalid Gemini API key" in result
 
-    def test_other_client_error_falls_back_with_generic_reason(self, rfmt_df, clv_df, segment_summary):
-        exc = genai_errors.ClientError(code=400, response_json={"error": {"message": "bad request"}})
+    def test_other_bad_request_error_falls_back_with_generic_reason(self, rfmt_df, clv_df, segment_summary):
+        # A 400 that is NOT the invalid-key shape (no 'API_KEY_INVALID' in the
+        # message) should get the generic reason, not be mistaken for a bad key.
+        exc = _make_gemini_api_error(400, "malformed generation_config", reason="INVALID_ARGUMENT")
+        mock_client = MagicMock()
+        mock_client.interactions.create.side_effect = exc
+
+        with patch("src.digest_engine.genai.Client", return_value=mock_client):
+            result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
+
+        assert "[Template Summary" in result
+        assert "Gemini API error" in result
+        assert "invalid Gemini API key" not in result
+
+    def test_server_error_falls_back_via_the_broad_apierror_base_class(self, rfmt_df, clv_df, segment_summary):
+        # InternalServerError is an APIStatusError subclass (still has
+        # status_code) -- goes through the same branch as the other status
+        # errors above and lands on the generic reason (no dedicated 5xx message).
+        exc = _make_gemini_api_error(500, "internal error")
+        assert isinstance(exc, genai_errors.InternalServerError)
         mock_client = MagicMock()
         mock_client.interactions.create.side_effect = exc
 
@@ -372,8 +454,18 @@ class TestGeminiFailuresDegradeGracefully:
         assert "[Template Summary" in result
         assert "Gemini API error" in result
 
-    def test_server_error_falls_back(self, rfmt_df, clv_df, segment_summary):
-        exc = genai_errors.ServerError(code=500, response_json={"error": {"message": "internal error"}})
+    def test_connection_error_is_caught_by_the_broad_apierror_base_class(self, rfmt_df, clv_df, segment_summary):
+        # APIConnectionError has no HTTP response/status_code at all (it's raised
+        # for network-level failures) -- it is NOT an APIStatusError subclass, so
+        # this specifically exercises the broader `except genai_errors.APIError`
+        # branch, confirming a future/less-common error variant still gets a
+        # diagnostic reason instead of silently falling through to the generic
+        # catch-all (the exact failure mode this fix addresses).
+        exc = genai_errors.APIConnectionError(message="connection failed", request=httpx.Request(
+            "POST", "https://generativelanguage.googleapis.com/v1beta/interactions"
+        ))
+        assert isinstance(exc, genai_errors.APIError)
+        assert not isinstance(exc, genai_errors.APIStatusError)
         mock_client = MagicMock()
         mock_client.interactions.create.side_effect = exc
 
@@ -381,7 +473,8 @@ class TestGeminiFailuresDegradeGracefully:
             result = generate_account_digest(rfmt_df, clv_df, segment_summary, gemini_api_key="fake-gemini-key")
 
         assert "[Template Summary" in result
-        assert "Gemini API server error" in result
+        assert "Gemini API error" in result
+        assert "unexpected error" not in result
 
     def test_generic_exception_falls_back_instead_of_raising(self, rfmt_df, clv_df, segment_summary):
         mock_client = MagicMock()
