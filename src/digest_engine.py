@@ -40,20 +40,54 @@ not just in a slide, and doesn't get silently violated by a well-intentioned
   Per-account digest (THIS DESIGN): one LLM call per ACCOUNT, per batch run.
         8 accounts * 1 call/day = 8 calls/day = ~240 calls/month.
     At Anthropic Haiku's per-call token cost, that's under $1/month at pilot
-    volume. On Gemini 2.5 Flash-Lite's free tier (the default -- see below), it's
-    genuinely $0, not just cheap. Either way, roughly two orders of magnitude
+    volume. Gemini's Flash-Lite tier (the default -- see "Provider details"
+    below for the specific model and a caveat on re-verifying its current
+    pricing/free-tier status) has historically been the free-tier-eligible
+    option at this call volume. Either way, roughly two orders of magnitude
     cheaper than the rejected design, for materially the same executive-facing
     value: a marketer wants one summary of their whole book of business per batch
     run, not one summary per customer.
 
 --- Provider details ---
 
-Gemini (default, GEMINI_MODEL_ID below): gemini-2.5-flash-lite is genuinely FREE
-of charge on Google's free tier at this call volume (as of 2026, per
-ai.google.dev/gemini-api/docs/pricing) -- not just cheap. Its paid-tier rate
-($0.10 / $0.40 per 1M input/output tokens) is also far below Anthropic Haiku's
-($1.00 / $5.00). Do not swap GEMINI_MODEL_ID for a Pro model -- Pro models
-require billing to be configured and are not on the free tier.
+Gemini (default, GEMINI_MODEL_ID below): pinned to gemini-3.5-flash-lite, the
+Flash-Lite-tier model Google's own API error message names as the replacement
+for the now-dead gemini-2.5-flash-lite (see "Model deprecation incident,
+2026-08-29" below). Do not swap GEMINI_MODEL_ID for a Pro model -- Pro models
+require billing to be configured and are not expected to be free-tier eligible.
+
+  Pricing/free-tier status NOT independently re-verified for this specific
+  model as of the date below -- ai.google.dev/gemini-api/docs/pricing was
+  unreachable from this environment (network egress blocks that domain) when
+  this fix was made, so the earlier $0.10/$0.40-per-1M-token and "genuinely
+  free" claims that were previously stated here for gemini-2.5-flash-lite are
+  DELIBERATELY NOT carried forward onto gemini-3.5-flash-lite without
+  verification -- doing so would silently rot the same way the original
+  deprecation-date assumption did (see incident note below). What IS confirmed
+  (live API calls against a real account, not docs): the model is listed via
+  client.models.list(), it is the Flash-Lite tier (same lineage as the prior
+  default), and real generate_account_digest() calls against it succeed and
+  return real generated text. Confirm current pricing/free-tier status in
+  Google AI Studio or the live pricing page before treating this as a $0
+  guarantee for a new deployment, and update this note (and the README's
+  cost-model section, which cites the same figures) once re-verified.
+
+  Model deprecation incident, 2026-08-29: gemini-2.5-flash-lite (and, tested
+  for comparison, gemini-2.5-flash) started returning `404 NotFoundError` --
+  "This model ... is no longer available to new users" -- confirmed via a live
+  call with a real API key/project, even though both models still appeared in
+  that same project's client.models.list() output with generateContent listed
+  as a supported action (i.e. the model-listing endpoint does not reliably
+  reflect per-model callability -- do not trust it alone). Both
+  client.interactions.create() AND the older client.models.generate_content()
+  failed identically (same 404, same message) for the dead models, and both
+  succeeded identically for gemini-3.5-flash-lite -- ruling out, for this
+  account, an earlier hypothesis that the Interactions API specifically was
+  broken for Flash-tier models. This was a straightforward model deprecation,
+  not an API-method bug, so no API-method change was made here (still
+  client.interactions.create() below, unchanged). Re-verify GEMINI_MODEL_ID
+  against client.models.list() periodically -- a model listed today is not
+  guaranteed to stay callable, per this incident.
 
   DATA-USAGE DISCLOSURE (read before deploying on the free tier): per Google's
   own pricing page, content sent to the Gemini API on the FREE TIER **is used to
@@ -129,8 +163,10 @@ MODEL_ID = "claude-haiku-4-5"
 MAX_TOKENS = 300
 REQUEST_TIMEOUT_SECONDS = 20.0
 
-# Gemini: free-tier default -- see the module docstring's "Provider details" above.
-GEMINI_MODEL_ID = "gemini-2.5-flash-lite"
+# Gemini: default provider -- see the module docstring's "Provider details" and
+# "Model deprecation incident, 2026-08-29" above for why this is
+# gemini-3.5-flash-lite and not gemini-2.5-flash-lite.
+GEMINI_MODEL_ID = "gemini-3.5-flash-lite"
 # Mirrors MAX_TOKENS's role for Anthropic: short paragraph only, bounds worst-case
 # cost. Passed as generation_config={"max_output_tokens": ...} on the
 # interactions.create() call below (google.genai.types.GenerationConfig's field).
