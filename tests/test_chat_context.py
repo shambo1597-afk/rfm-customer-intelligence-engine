@@ -8,7 +8,12 @@ nothing here to mock.
 import pandas as pd
 import pytest
 
-from src.chat_context import build_account_context_blob, build_context_text, GROWTH_TARGETS_TOP_N
+from src.chat_context import (
+    build_account_context_blob,
+    build_context_text,
+    build_methodology_context,
+    GROWTH_TARGETS_TOP_N,
+)
 from src.digest_engine import _build_aggregate_stats
 
 
@@ -27,6 +32,7 @@ class TestBlobStructure:
         assert set(context_blob.keys()) == {
             "aggregate_stats", "segment_breakdown", "churn_watchlist",
             "growth_targets", "cohort_retention_by_month", "segment_cluster_crosstab",
+            "methodology",
         }
 
     def test_aggregate_stats_matches_digest_engines_own_function_exactly(
@@ -166,3 +172,129 @@ class TestBuildAccountContextBlobDoesNotMutateInputs:
         before = segment_summary.copy(deep=True)
         build_account_context_blob(rfmt_df, clv_df, segment_summary, cohort_retention_matrix, crosstab_counts)
         pd.testing.assert_frame_equal(before, segment_summary)
+
+
+class TestMethodologyContextCrossReferencesReadme:
+    """
+    The actual point of this test class: build_methodology_context() must
+    contain the SAME facts/numbers as the specific README.md sections it
+    claims to source from -- not just "a methodology section exists" but
+    "the honest, specific claims a professor could fact-check are actually
+    in there." The expected values below were copied by hand from README.md
+    at the time this test was written (not derived from the function under
+    test) -- if a real recalibration changes the backtest numbers, THIS test
+    should fail until README.md and this file are updated together.
+    """
+
+    @pytest.fixture(scope="module")
+    def methodology(self):
+        return build_methodology_context()
+
+    def test_returns_the_documented_top_level_keys(self, methodology):
+        assert set(methodology.keys()) == {
+            "rfm_segment_methodology", "clv_model_caveats",
+            "ml_clustering_scope", "backtest_results",
+        }
+
+    def test_segment_precedence_order_matches_readme_rule_precedence_section(self, methodology):
+        # Source: README "Rule precedence" under "Enterprise 7-Segment
+        # Taxonomy & Marketing Playbooks" -- the exact first-match-wins order.
+        assert methodology["rfm_segment_methodology"]["precedence_order"] == [
+            "New Customers", "Champions", "Can't Lose Them", "At-Risk VIPs",
+            "Potential Growth", "Loyalists", "Hibernating",
+        ]
+
+    def test_clv_model_is_described_as_heuristic_not_a_fitted_probabilistic_model(self, methodology):
+        # Source: README "5. Heuristic Churn-Hazard Model (BTYD-Inspired)".
+        # Do not soften this into "a BTYD model" or similar.
+        model_type = methodology["clv_model_caveats"]["model_type"].lower()
+        assert "heuristic" in model_type
+        assert "not a fitted" in model_type or "not fitted" in model_type
+        assert "no likelihood" in model_type or "no posterior" in model_type
+
+    def test_clv_constants_are_described_as_manually_tuned_not_data_derived(self, methodology):
+        # Source: README "Configuring the Churn Hazard Model".
+        caveat = methodology["clv_model_caveats"]["constants_are_manually_tuned"].lower()
+        assert "manually-tuned" in caveat or "manually tuned" in caveat
+        assert "not a value derived from real churn outcomes" in caveat or "not derived from real" in caveat
+
+    def test_ml_clustering_is_described_as_validation_only_never_modulating_segment(self, methodology):
+        # Source: README "ML Cluster vs. Segment Agreement: What the
+        # Clustering Step Is Actually For" -- the specific claim a professor
+        # is likely to probe: does clustering change which segment a
+        # customer is in? The README says no, explicitly -- so must this.
+        scope = methodology["ml_clustering_scope"]["validation_only"]
+        assert "does NOT modulate the Segment label" in scope
+        assert "Urgent Churn Watchlist" in scope
+        assert "deliberate scope boundary" in scope
+
+    def test_synthetic_backtest_numbers_match_readme_exactly(self, methodology):
+        # Source: README "Results on the synthetic dataset (ecommerce_
+        # transactions.csv, 384 backtested customers)" table + churn-flag line.
+        synth = methodology["backtest_results"]["synthetic_dataset"]
+        assert synth["n_backtested_customers"] == 384
+        assert synth["model_mae_usd"] == 752.61
+        assert synth["model_rmse_usd"] == 1172.77
+        assert synth["baseline_trailing_90d_mae_usd"] == 912.36
+        assert synth["baseline_population_mean_mae_usd"] == 966.68
+        assert synth["model_beats_both_baselines_on_mae"] is True
+        assert synth["churn_flag_precision_pct"] == 74.6
+        assert synth["churn_flag_recall_pct"] == 47.5
+
+    def test_real_dataset_backtest_numbers_match_readme_exactly(self, methodology):
+        # Source: README "Results on the real UCI Online Retail dataset
+        # (real_online_retail.csv.gz, 3,370 backtested customers)" table +
+        # churn-flag line. This is the single most important fact in this
+        # whole file to get right: it must say the model LOSES here.
+        real = methodology["backtest_results"]["real_uci_dataset"]
+        assert real["n_backtested_customers"] == 3370
+        assert real["model_mae_usd"] == 682.05
+        assert real["model_rmse_usd"] == 4232.38
+        assert real["baseline_trailing_90d_mae_usd"] == 657.56
+        assert real["baseline_trailing_90d_rmse_usd"] == 4054.82
+        assert real["model_beats_both_baselines_on_mae"] is False
+        assert real["churn_flag_precision_pct"] == 48.4
+        assert real["churn_flag_recall_pct"] == 10.3
+
+    def test_honest_bottom_line_states_the_model_loses_on_real_data_without_spin(self, methodology):
+        # Source: README "Bottom line" paragraph. Assert on the actual claim,
+        # not just that some text is present -- a vague or softened
+        # restatement would defeat the entire point of this section.
+        bottom_line = methodology["backtest_results"]["honest_bottom_line"]
+        assert "does NOT beat" in bottom_line
+        assert "trailing-spend baseline wins" in bottom_line or "trailing spend baseline wins" in bottom_line.replace("-", " ")
+        assert "10.3%" in bottom_line
+
+
+class TestContextTextIncludesMethodologySection:
+    """Confirms build_context_text() actually serializes the methodology
+    section (not just that build_account_context_blob() carries it in the
+    dict) -- this is what the model actually sees in the system prompt."""
+
+    def test_methodology_section_header_is_present(self, context_text):
+        assert "MODEL METHODOLOGY & KNOWN LIMITATIONS" in context_text
+
+    def test_segment_precedence_rules_appear_in_order(self, context_text):
+        idx_new = context_text.index("New Customers is checked first")
+        idx_champions = context_text.index("Champions is checked next")
+        idx_cant_lose = context_text.index("Can't Lose Them is checked before At-Risk VIPs")
+        idx_hibernating = context_text.index("Hibernating is the default")
+        assert idx_new < idx_champions < idx_cant_lose < idx_hibernating
+
+    def test_clv_heuristic_caveat_appears(self, context_text):
+        assert "NOT a fitted probabilistic model" in context_text
+
+    def test_ml_clustering_validation_only_scope_appears(self, context_text):
+        assert "does NOT modulate the Segment label" in context_text
+
+    def test_real_dataset_backtest_numbers_appear(self, context_text):
+        assert "$682.05" in context_text  # real-dataset model MAE
+        assert "$657.56" in context_text  # real-dataset trailing-90d baseline MAE (the winner)
+        assert "10.3%" in context_text    # real-dataset churn-flag recall
+
+    def test_synthetic_dataset_backtest_numbers_appear(self, context_text):
+        assert "$752.61" in context_text  # synthetic-dataset model MAE
+        assert "74.6%" in context_text    # synthetic-dataset churn-flag precision
+
+    def test_honest_bottom_line_appears_verbatim_in_spirit(self, context_text):
+        assert "does NOT beat the simplest baseline" in context_text

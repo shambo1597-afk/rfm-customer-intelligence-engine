@@ -55,6 +55,17 @@ tests/test_digest_engine.py::test_prompt_never_contains_a_raw_customer_id.
 - Segment x ML_Cluster crosstab: reduced to each segment's single dominant
   ML_Cluster and that cluster's share of the segment -- not the full grid --
   same "keep it compact" reasoning as the cohort summary above.
+- Methodology & known limitations (build_methodology_context()): static content
+  about the PIPELINE'S OWN DESIGN (segment rule precedence, the CLV model's
+  heuristic/not-fitted nature, the ML clustering's validation-only scope, and
+  the actual out-of-sample backtest numbers) -- not per-account data, computed
+  once, effectively free. Added so the chatbot can answer methodology/
+  confidence/limitations questions ("how confident is this CLV number," "does
+  ML clustering change a customer's segment") accurately instead of only being
+  able to restate a raw number with no context to reason about it. Every fact
+  in it is pulled from an already-written, already-verified README section --
+  see the source-section comment next to each fact in
+  build_methodology_context() below. Nothing here is invented.
 """
 
 from src.digest_engine import _build_aggregate_stats
@@ -78,6 +89,152 @@ def _segment_value_counts_dict(df, column: str = "Segment") -> dict:
     if df is None or df.empty or column not in df.columns:
         return {}
     return {str(k): int(v) for k, v in df[column].value_counts().items()}
+
+
+def build_methodology_context() -> dict:
+    """
+    Static methodology/limitations content about the PIPELINE'S OWN DESIGN --
+    not per-account data, takes no DataFrame inputs, and needs no computation
+    (it's a fixed dict of facts already written and verified in README.md).
+    Effectively free relative to the rest of the blob; still built once per
+    batch run alongside everything else in this file, for a single call site
+    and a single place to keep this in sync with the README.
+
+    Every fact below is pulled from an EXISTING, already-verified README
+    section -- see the comment citing the source section next to each one.
+    Nothing here is a new caveat, threshold, or number invented for this
+    function; where a number appears, it is the exact figure the README
+    reports (paraphrasing prose for prompt brevity is fine per the task that
+    added this function, but numbers are copied verbatim).
+    """
+    rfm_segment_methodology = {
+        # Source: README "Rule precedence" under "Enterprise 7-Segment
+        # Taxonomy & Marketing Playbooks" -- assign_segments_vectorized()
+        # (src/rfm_engine.py) resolves overlapping rule matches via
+        # numpy.select, first-match-wins, in this exact order (not the
+        # value-tier display order of the segment table).
+        "precedence_order": [
+            "New Customers", "Champions", "Can't Lose Them", "At-Risk VIPs",
+            "Potential Growth", "Loyalists", "Hibernating",
+        ],
+        "precedence_rules": [
+            "New Customers is checked first and deliberately overrides any other match, "
+            "so a customer's very first purchase isn't misclassified as an established "
+            "Champion just because it happened to be large.",
+            "Champions is checked next.",
+            "Can't Lose Them is checked before At-Risk VIPs because Recency-score 1 "
+            "(completely dormant) is a stricter, more urgent subset of At-Risk VIPs' "
+            "Recency-score <= 2 condition -- e.g. a completely dormant former big spender "
+            "is deterministically Can't Lose Them, never At-Risk VIPs.",
+            "At-Risk VIPs is checked next.",
+            "Potential Growth is checked next.",
+            "Loyalists is checked next.",
+            "Hibernating is the default -- every customer matching none of the above rules.",
+        ],
+    }
+
+    clv_model_caveats = {
+        # Source: README "5. Heuristic Churn-Hazard Model (BTYD-Inspired) CLV
+        # & Churn Radar" -- states this explicitly, do not soften it.
+        "model_type": (
+            "A heuristic, rule-based hazard function inspired by the shape of "
+            "continuous-time Buy-Till-You-Die (BTYD/BG-NBD) models -- NOT a fitted "
+            "probabilistic model in the statistical sense: no likelihood is "
+            "maximized, no posterior is estimated."
+        ),
+        # Source: README "Configuring the Churn Hazard Model".
+        "constants_are_manually_tuned": (
+            "Every constant in the formula (the lambda-smoothing alpha/beta priors "
+            "and the four churn-hazard weight/offset terms) is a manually-tuned "
+            "default calibrated to look reasonable on this project's SYNTHETIC "
+            "dataset -- not a value derived from real churn outcomes. They are "
+            "exposed as function parameters on estimate_btyd_clv() specifically so "
+            "a real deployment can recalibrate them against its own known-outcome "
+            "data instead of trusting these defaults."
+        ),
+    }
+
+    ml_clustering_scope = {
+        # Source: README "ML Cluster vs. Segment Agreement: What the
+        # Clustering Step Is Actually For".
+        "independence": (
+            "K-Means clustering and the 7-segment rule taxonomy are computed "
+            "completely independently -- the rules have no knowledge of the "
+            "clustering, and K-Means has no knowledge of the rules."
+        ),
+        "validation_only": (
+            "The Segment x ML_Cluster crosstab is a validation/diagnostic tool for "
+            "the analyst -- it answers whether the unsupervised clustering "
+            "corroborates the hand-picked segment thresholds, or suggests one needs "
+            "revisiting. It does NOT modulate the Segment label, the Urgent Churn "
+            "Watchlist's ranking, or any other customer-facing output anywhere in "
+            "this platform. This is a deliberate scope boundary for this version, "
+            "not an unfinished feature."
+        ),
+    }
+
+    backtest_results = {
+        # Source: README "Model Validation & Backtest Results" -- "Method" paragraph.
+        "method": (
+            "backtest_clv.py picks a cutoff date 90 days before the last transaction "
+            "in the dataset, computes RFM-T and the CLV forecast using only "
+            "transactions on or before that cutoff, then compares the forecast "
+            "against what those customers ACTUALLY did in the following 90 days -- "
+            "a genuine temporal train/test split, not a check against the same data "
+            "the model was fit on. Checked against two naive baselines computed the "
+            "same out-of-sample way: each customer repeats their own trailing "
+            "90-day spend, and every customer gets the population-average trailing "
+            "spend."
+        ),
+        # Source: README "Results on the synthetic dataset (ecommerce_transactions.csv,
+        # 384 backtested customers)" -- figures copied verbatim.
+        "synthetic_dataset": {
+            "n_backtested_customers": 384,
+            "model_mae_usd": 752.61,
+            "model_rmse_usd": 1172.77,
+            "baseline_trailing_90d_mae_usd": 912.36,
+            "baseline_trailing_90d_rmse_usd": 1485.98,
+            "baseline_population_mean_mae_usd": 966.68,
+            "baseline_population_mean_rmse_usd": 1265.96,
+            "model_beats_both_baselines_on_mae": True,
+            "churn_flag_precision_pct": 74.6,
+            "churn_flag_recall_pct": 47.5,
+        },
+        # Source: README "Results on the real UCI Online Retail dataset
+        # (real_online_retail.csv.gz, 3,370 backtested customers)" -- figures
+        # copied verbatim, INCLUDING the honest negative finding.
+        "real_uci_dataset": {
+            "n_backtested_customers": 3370,
+            "model_mae_usd": 682.05,
+            "model_rmse_usd": 4232.38,
+            "baseline_trailing_90d_mae_usd": 657.56,
+            "baseline_trailing_90d_rmse_usd": 4054.82,
+            "baseline_population_mean_mae_usd": 910.68,
+            "baseline_population_mean_rmse_usd": 5015.35,
+            "model_beats_both_baselines_on_mae": False,
+            "churn_flag_precision_pct": 48.4,
+            "churn_flag_recall_pct": 10.3,
+        },
+        # Source: README "Bottom line" paragraph -- the single most important
+        # fact to get right here, per the task that added this function:
+        # state it accurately and without spin, never soften it.
+        "honest_bottom_line": (
+            "On REAL transaction data, the model does NOT beat the simplest "
+            "baseline (predicting each customer repeats their own trailing 90-day "
+            "spend) on either MAE or RMSE -- it is close, but the trailing-spend "
+            "baseline wins. Treat the 90-day spend forecast and the churn flag as a "
+            "cheap, directional prioritization signal, not a precise forecast: on "
+            "real data it misses roughly 9 out of 10 customers who actually go "
+            "quiet (10.3% recall)."
+        ),
+    }
+
+    return {
+        "rfm_segment_methodology": rfm_segment_methodology,
+        "clv_model_caveats": clv_model_caveats,
+        "ml_clustering_scope": ml_clustering_scope,
+        "backtest_results": backtest_results,
+    }
 
 
 def build_account_context_blob(
@@ -106,7 +263,7 @@ def build_account_context_blob(
     Returns a dict of aggregate-only sub-sections (see module docstring for
     exactly what each contains and why nothing here is per-customer):
       aggregate_stats, segment_breakdown, churn_watchlist, growth_targets,
-      cohort_retention_by_month, segment_cluster_crosstab.
+      cohort_retention_by_month, segment_cluster_crosstab, methodology.
     """
     aggregate_stats = _build_aggregate_stats(rfmt_df, clv_df, segment_summary)
 
@@ -163,6 +320,7 @@ def build_account_context_blob(
         "growth_targets": growth_targets,
         "cohort_retention_by_month": cohort_retention_by_month,
         "segment_cluster_crosstab": segment_cluster_crosstab,
+        "methodology": build_methodology_context(),
     }
 
 
@@ -204,6 +362,44 @@ def build_context_text(blob: dict) -> str:
         for segment, info in blob["segment_cluster_crosstab"].items()
     ) or "- (no ML clustering data available)"
 
+    methodology = blob["methodology"]
+    rfm_meth = methodology["rfm_segment_methodology"]
+    precedence_lines = "\n".join(
+        f"{i}. {rule}" for i, rule in enumerate(rfm_meth["precedence_rules"], start=1)
+    )
+    clv_caveats = methodology["clv_model_caveats"]
+    ml_scope = methodology["ml_clustering_scope"]
+    bt = methodology["backtest_results"]
+    synth = bt["synthetic_dataset"]
+    real = bt["real_uci_dataset"]
+
+    methodology_text = (
+        "MODEL METHODOLOGY & KNOWN LIMITATIONS (use this section for questions about "
+        "HOW the scoring/segmentation/CLV works, its accuracy, or its limitations -- "
+        "not about this account's specific numbers)\n\n"
+        f"Segment assignment order ({', '.join(rfm_meth['precedence_order'])}) is "
+        "first-match-wins, not the display order of the segment table:\n"
+        f"{precedence_lines}\n\n"
+        f"CLV/churn model: {clv_caveats['model_type']} {clv_caveats['constants_are_manually_tuned']}\n\n"
+        f"ML clustering scope: {ml_scope['independence']} {ml_scope['validation_only']}\n\n"
+        f"Out-of-sample backtest results ({bt['method']}):\n"
+        f"- Synthetic dataset ({synth['n_backtested_customers']:,} backtested customers): "
+        f"model MAE ${synth['model_mae_usd']:,.2f} / RMSE ${synth['model_rmse_usd']:,.2f}, "
+        f"vs. trailing-90-day baseline MAE ${synth['baseline_trailing_90d_mae_usd']:,.2f} / "
+        f"RMSE ${synth['baseline_trailing_90d_rmse_usd']:,.2f} and population-mean baseline "
+        f"MAE ${synth['baseline_population_mean_mae_usd']:,.2f} / RMSE ${synth['baseline_population_mean_rmse_usd']:,.2f} "
+        f"-- the model beats both baselines on MAE here. Churn flag: "
+        f"{synth['churn_flag_precision_pct']:.1f}% precision, {synth['churn_flag_recall_pct']:.1f}% recall.\n"
+        f"- Real UCI Online Retail dataset ({real['n_backtested_customers']:,} backtested customers): "
+        f"model MAE ${real['model_mae_usd']:,.2f} / RMSE ${real['model_rmse_usd']:,.2f}, "
+        f"vs. trailing-90-day baseline MAE ${real['baseline_trailing_90d_mae_usd']:,.2f} / "
+        f"RMSE ${real['baseline_trailing_90d_rmse_usd']:,.2f} and population-mean baseline "
+        f"MAE ${real['baseline_population_mean_mae_usd']:,.2f} / RMSE ${real['baseline_population_mean_rmse_usd']:,.2f} "
+        f"-- the model does NOT beat the trailing-90-day baseline here. Churn flag: "
+        f"{real['churn_flag_precision_pct']:.1f}% precision, {real['churn_flag_recall_pct']:.1f}% recall.\n\n"
+        f"{bt['honest_bottom_line']}\n"
+    )
+
     return (
         "ACCOUNT-WIDE AGGREGATE STATISTICS\n"
         f"Total customers: {stats['total_customers']:,}\n"
@@ -224,5 +420,6 @@ def build_context_text(blob: dict) -> str:
         "COHORT RETENTION (average across all acquisition cohorts, by month since acquisition)\n"
         f"{cohort_lines}\n\n"
         "SEGMENT x ML CLUSTER AGREEMENT (independent unsupervised validation of the segment rules)\n"
-        f"{crosstab_lines}\n"
+        f"{crosstab_lines}\n\n"
+        f"{methodology_text}"
     )
