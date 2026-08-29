@@ -50,6 +50,8 @@ from src.digest_engine import (
     get_gemini_api_key,
     get_digest_provider_override
 )
+from src.chat_context import build_account_context_blob, build_context_text
+from src.chat_engine import answer_account_question
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -282,6 +284,21 @@ def cached_generate_account_digest(rfmt_df: pd.DataFrame, clv_df: pd.DataFrame,
         gemini_api_key=gemini_api_key,
         provider_override=provider_override
     )
+
+
+@st.cache_data(show_spinner="Building account context for Chat Q&A...")
+def cached_build_account_context_blob(rfmt_df: pd.DataFrame, clv_df: pd.DataFrame,
+                                       segment_summary: pd.DataFrame,
+                                       cohort_matrix: pd.DataFrame,
+                                       crosstab_counts: pd.DataFrame):
+    # Built ONCE per batch run (cached, same as every other pipeline output),
+    # never rebuilt per question -- see src/chat_context.py's module docstring
+    # for why this is a static blob, not a live query, and
+    # src/chat_engine.py's cost-model section for what "once per batch run"
+    # buys here specifically (it bounds the CONTEXT side of the cost, not the
+    # per-question LLM call itself -- chat's cost model is usage-based, unlike
+    # the digest's fixed-per-batch-run one).
+    return build_account_context_blob(rfmt_df, clv_df, segment_summary, cohort_matrix, crosstab_counts)
 
 
 def render_kpi(label: str, value: str, subtext: str = "", style: str = "blue"):
@@ -543,11 +560,26 @@ with st.sidebar:
             "production deployment."
         )
     )
-    anthropic_api_key = get_anthropic_api_key() if enable_ai_digest else None
-    gemini_api_key = get_gemini_api_key() if enable_ai_digest else None
-    digest_provider_override = get_digest_provider_override() if enable_ai_digest else None
-    if enable_ai_digest and not anthropic_api_key and not gemini_api_key:
-        st.caption("⚠️ No GEMINI_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — will show a template summary instead.")
+    enable_chat_qa = st.checkbox(
+        "Enable Chat Q&A — uses the same API key as AI Digest",
+        value=False,
+        help=(
+            "Off by default. A separate feature from the AI Digest above — lets you "
+            "ask natural-language questions about this account, answered ONLY from "
+            "the same precomputed aggregate stats shown across this dashboard "
+            "(segments, churn watchlist, growth targets, cohort retention, ML "
+            "clustering) — never a live query, never raw per-customer rows, no "
+            "tool-calling back into the pipeline mid-conversation. See README § Chat "
+            "Q&A (Optional) — its cost model is USAGE-based (one call per question "
+            "asked), unlike the AI Digest's fixed one-call-per-batch-run cost."
+        )
+    )
+    resolve_llm_keys = enable_ai_digest or enable_chat_qa
+    anthropic_api_key = get_anthropic_api_key() if resolve_llm_keys else None
+    gemini_api_key = get_gemini_api_key() if resolve_llm_keys else None
+    digest_provider_override = get_digest_provider_override() if resolve_llm_keys else None
+    if resolve_llm_keys and not anthropic_api_key and not gemini_api_key:
+        st.caption("⚠️ No GEMINI_API_KEY or ANTHROPIC_API_KEY found in st.secrets/env — AI Digest will show a template summary, and Chat Q&A will be unavailable.")
 
     st.markdown("---")
     st.caption("RFM-T / K-Means / PCA / CLV Scoring: 100% Baked-In • Zero External API Cost")
@@ -574,6 +606,37 @@ active_state_sig = f"{data_source_label}#{snapshot_date}#{col_cust}#{col_date}#{
 if "prev_state_sig" in st.session_state and st.session_state["prev_state_sig"] != active_state_sig:
     st.toast(f"Intelligence refreshed: {len(rfmt_df):,} customers loaded from {data_source_label}", icon="🎯")
 st.session_state["prev_state_sig"] = active_state_sig
+
+
+# -------------------------------------------------------------------------------------------------
+# Batch-Level Context Outputs (segment KPIs, cohort retention, Segment x ML_Cluster crosstab)
+# -------------------------------------------------------------------------------------------------
+# Computed once per batch run, independent of any tab's own interactive widgets
+# (e.g. tab 3's live k-selection slider) -- both the AI Digest and the Chat Q&A
+# context blob need a STABLE snapshot of these, not one that silently changes
+# depending on which tab the user last visited or what they happen to be
+# exploring there. The clustering/crosstab step here picks k via the same
+# Silhouette-argmax procedure tab 3 uses for its own default, wrapped
+# defensively since clustering can legitimately fail on a very small or
+# degenerate dataset -- build_account_context_blob() (src/chat_context.py)
+# already treats a missing crosstab as "no ML clustering data available"
+# rather than raising, so a failure here only narrows the context blob, never
+# crashes the app.
+segment_summary = get_segment_kpi_summary(clv_df)
+
+try:
+    _, batch_retention_matrix, _ = cached_compute_monthly_cohort_matrix(clean_tx)
+except Exception:
+    batch_retention_matrix = None
+
+try:
+    X_scaled_batch, _, _ = cached_preprocess_rfmt_features(clv_df)
+    eval_df_batch = cached_evaluate_kmeans_candidates(X_scaled_batch, min_k=2, max_k=7)
+    optimal_k_batch = int(eval_df_batch.loc[eval_df_batch["Silhouette_Score"].idxmax()]["k"])
+    df_clustered_batch, _, _ = cached_perform_kmeans_clustering(clv_df, n_clusters=optimal_k_batch)
+    batch_crosstab_counts, _ = compute_segment_cluster_crosstab(df_clustered_batch)
+except Exception:
+    batch_crosstab_counts = None
 
 
 # -------------------------------------------------------------------------------------------------
@@ -693,7 +756,8 @@ with tab2:
     st.subheader("🎯 Enterprise RFM-T 7-Segment Value Hierarchy")
     st.caption("Customer classification using Recency, Frequency, Monetary, and Tenure quintile scoring (1-5 scale).")
 
-    segment_summary = get_segment_kpi_summary(clv_df)
+    # segment_summary is computed once at the batch level (above, alongside the
+    # other Chat Q&A / AI Digest context inputs) rather than re-derived here.
 
     col_treemap, col_charts = st.columns([1, 1])
 
@@ -773,6 +837,59 @@ with tab2:
                 st.caption("ℹ️ Showing the template summary — configure GEMINI_API_KEY (free) or ANTHROPIC_API_KEY for the AI-generated version.")
         else:
             st.info("Enable \"AI Digest\" in the sidebar to generate this summary.")
+
+    st.markdown("---")
+    with st.expander("💬 Ask About This Account", expanded=False):
+        st.caption(
+            "Ask natural-language questions about this account — answered ONLY "
+            "from the same precomputed aggregate stats shown across this "
+            "dashboard (segments, churn watchlist, growth targets, cohort "
+            "retention, ML clustering) — never a live query against raw "
+            "customer rows, never tool-calling back into the pipeline "
+            "mid-conversation. A separate, optional feature from the AI Digest "
+            "above; off by default. See README § Chat Q&A (Optional) for the "
+            "usage-based cost model."
+        )
+        if enable_chat_qa:
+            # Reset the conversation whenever the active account/dataset changes
+            # (active_state_sig, computed once above) -- stale chat history from
+            # a previous dataset must never bleed into a new one.
+            if st.session_state.get("chat_context_sig") != active_state_sig:
+                st.session_state["chat_conversation_history"] = []
+                st.session_state["chat_context_sig"] = active_state_sig
+
+            context_blob = cached_build_account_context_blob(
+                rfmt_df, clv_df, segment_summary, batch_retention_matrix, batch_crosstab_counts
+            )
+            context_text = build_context_text(context_blob)
+
+            for turn in st.session_state["chat_conversation_history"]:
+                with st.chat_message(turn["role"]):
+                    st.markdown(turn["content"])
+
+            question = st.chat_input("Ask a question about this account...")
+            if question:
+                with st.chat_message("user"):
+                    st.markdown(question)
+                with st.spinner("Thinking..."):
+                    answer = answer_account_question(
+                        question, context_text,
+                        st.session_state["chat_conversation_history"],
+                        anthropic_api_key=anthropic_api_key,
+                        gemini_api_key=gemini_api_key,
+                        provider_override=digest_provider_override,
+                    )
+                with st.chat_message("assistant"):
+                    st.markdown(answer)
+                # answer_account_question() already appended the successful turn
+                # to chat_conversation_history in place -- see its docstring. A
+                # failed turn is intentionally NOT recorded, so nothing more to
+                # do here either way.
+
+            if not anthropic_api_key and not gemini_api_key:
+                st.caption("ℹ️ Configure GEMINI_API_KEY (free) or ANTHROPIC_API_KEY to enable Chat Q&A answers.")
+        else:
+            st.info("Enable \"Chat Q&A\" in the sidebar to ask questions about this account.")
 
 
 # -------------------------------------------------------------------------------------------------
