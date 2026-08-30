@@ -29,6 +29,7 @@ from src.chat_engine import (
     answer_account_question,
     escape_markdown_dollar_signs,
     CHAT_MAX_OUTPUT_TOKENS,
+    GROQ_CHAT_MAX_OUTPUT_TOKENS,
     CHAT_SYSTEM_PROMPT_TEMPLATE,
     _chat_unavailable,
 )
@@ -267,7 +268,10 @@ class TestSuccessfulGroqCall:
 
         _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
         assert kwargs["model"] == GROQ_MODEL_ID
-        assert kwargs["max_tokens"] == CHAT_MAX_OUTPUT_TOKENS
+        # The Groq call gets CHAT_MAX_OUTPUT_TOKENS PLUS reasoning headroom
+        # (GROQ_CHAT_MAX_OUTPUT_TOKENS), not the bare visible-answer target --
+        # see GROQ_REASONING_TOKEN_HEADROOM's comment in digest_engine.py.
+        assert kwargs["max_tokens"] == GROQ_CHAT_MAX_OUTPUT_TOKENS
         # Last message is this turn's question.
         assert kwargs["messages"][-1] == {"role": "user", "content": "A question?"}
 

@@ -56,12 +56,26 @@ from src.digest_engine import (
     _resolve_provider,
     _call_groq,
     _call_anthropic,
+    GROQ_REASONING_TOKEN_HEADROOM,
 )
 
 # One or two sentences only -- smaller than even the digest's 300-token cap,
 # since this is explaining a single already-identified number, not
-# summarizing a whole account.
+# summarizing a whole account. This is the visible-answer target passed to
+# Anthropic unchanged; see GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS below for
+# what's actually sent to Groq.
+#
+# THIS is the exact constant whose original value (150, with no reasoning
+# headroom at all) caused the live truncation/empty-response bug this fix
+# addresses -- see GROQ_REASONING_TOKEN_HEADROOM's own comment in
+# digest_engine.py for the full incident. 150 tokens left essentially no
+# room for openai/gpt-oss-120b's hidden reasoning at all, so this was the
+# single most exposed call site of the four.
 COHORT_NARRATION_MAX_OUTPUT_TOKENS = 150
+# The value actually passed as max_tokens on the Groq call specifically --
+# COHORT_NARRATION_MAX_OUTPUT_TOKENS's own visible-answer target (150) is
+# unchanged; only Groq's call gets the extra reasoning headroom.
+GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS = COHORT_NARRATION_MAX_OUTPUT_TOKENS + GROQ_REASONING_TOKEN_HEADROOM
 
 _UNAVAILABLE_PREFIX = "**[Cohort narration temporarily unavailable"
 
@@ -157,7 +171,7 @@ def narrate_cohort_pattern(
         text, failure_reason = _call_groq(
             messages=[{"role": "user", "content": prompt}],
             api_key=groq_api_key,
-            max_tokens=COHORT_NARRATION_MAX_OUTPUT_TOKENS,
+            max_tokens=GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS,
         )
     else:
         # provider == "anthropic"

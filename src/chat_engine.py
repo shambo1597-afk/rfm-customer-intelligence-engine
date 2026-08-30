@@ -116,13 +116,23 @@ from src.digest_engine import (
     MODEL_ID,
     GROQ_MODEL_ID,
     GROQ_REQUEST_TIMEOUT_SECONDS,
+    GROQ_REASONING_TOKEN_HEADROOM,
 )
 
 # Chat answers get more room than the digest's 300-token cap (a single
 # executive-summary paragraph) -- a real answer to an analyst's question may
 # reasonably run a bit longer, but this still bounds worst-case per-call cost
-# and keeps answers focused rather than open-ended.
+# and keeps answers focused rather than open-ended. Passed to _call_anthropic()
+# unchanged (500) -- the +GROQ_REASONING_TOKEN_HEADROOM below only applies to
+# the value actually sent to Groq's chat.completions.create(), since Claude
+# Haiku is not a reasoning model and was never at risk of this failure mode
+# (see GROQ_REASONING_TOKEN_HEADROOM's own comment in digest_engine.py for
+# the full incident this headroom fixes).
 CHAT_MAX_OUTPUT_TOKENS = 500
+# The value actually passed as max_tokens on the Groq call specifically --
+# CHAT_MAX_OUTPUT_TOKENS's own visible-answer target (500) is unchanged;
+# only Groq's call gets the extra reasoning headroom.
+GROQ_CHAT_MAX_OUTPUT_TOKENS = CHAT_MAX_OUTPUT_TOKENS + GROQ_REASONING_TOKEN_HEADROOM
 
 _UNAVAILABLE_PREFIX = "**[Chat temporarily unavailable"
 
@@ -322,7 +332,7 @@ def answer_account_question(
         text, failure_reason = _call_groq(
             messages=messages,
             api_key=groq_api_key,
-            max_tokens=CHAT_MAX_OUTPUT_TOKENS,
+            max_tokens=GROQ_CHAT_MAX_OUTPUT_TOKENS,
         )
     else:
         # provider == "anthropic"

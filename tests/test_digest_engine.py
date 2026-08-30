@@ -32,6 +32,8 @@ from src.digest_engine import (
     GROQ_MODEL_ID,
     GROQ_MAX_OUTPUT_TOKENS,
     GROQ_REQUEST_TIMEOUT_SECONDS,
+    GROQ_REASONING_EFFORT,
+    GROQ_REASONING_TOKEN_HEADROOM,
 )
 
 
@@ -91,6 +93,32 @@ class TestNamedConstants:
         # of seconds, not left unset/None/0.
         assert isinstance(GROQ_REQUEST_TIMEOUT_SECONDS, (int, float))
         assert GROQ_REQUEST_TIMEOUT_SECONDS > 0
+
+    def test_groq_reasoning_effort_is_a_valid_supported_value(self):
+        # 'low', 'medium', or 'high' are the only values Groq documents as
+        # supported for openai/gpt-oss-120b specifically -- see
+        # GROQ_REASONING_EFFORT's own comment for the two independent
+        # sources (WebSearch of Groq's docs + the pinned groq package's own
+        # request-parameter type stub) that confirm this.
+        assert GROQ_REASONING_EFFORT in ("low", "medium", "high")
+
+    def test_groq_reasoning_effort_is_low_not_the_provider_default(self):
+        # Deliberately NOT "medium" (Groq's own default) -- see
+        # GROQ_REASONING_EFFORT's comment for why every prompt this codebase
+        # sends via Groq is simple enough that "low" is the right choice.
+        assert GROQ_REASONING_EFFORT == "low"
+
+    def test_groq_reasoning_token_headroom_is_a_positive_module_level_constant(self):
+        assert isinstance(GROQ_REASONING_TOKEN_HEADROOM, int)
+        assert GROQ_REASONING_TOKEN_HEADROOM > 0
+
+    def test_groq_max_output_tokens_has_real_headroom_over_the_original_300(self):
+        # Regression guard for the actual live bug this fix addresses: 300
+        # (the original, headroom-free value) was insufficient for a
+        # reasoning model -- GROQ_MAX_OUTPUT_TOKENS must never silently
+        # shrink back down to it.
+        assert GROQ_MAX_OUTPUT_TOKENS > 300
+        assert GROQ_MAX_OUTPUT_TOKENS == 300 + GROQ_REASONING_TOKEN_HEADROOM
 
 
 class TestResolveProvider:
@@ -509,9 +537,12 @@ class TestCallGroqInIsolation:
     since that's each caller's own concern, not this function's.
     """
 
-    def _mock_response(self, text="A generated answer."):
+    def _mock_response(self, text="A generated answer.", finish_reason="stop"):
         return types.SimpleNamespace(
-            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=text))]
+            choices=[types.SimpleNamespace(
+                message=types.SimpleNamespace(content=text),
+                finish_reason=finish_reason,
+            )]
         )
 
     def test_success_returns_text_and_no_failure_reason(self):
@@ -541,8 +572,21 @@ class TestCallGroqInIsolation:
         assert kwargs["model"] == GROQ_MODEL_ID
         assert kwargs["max_tokens"] == 123
         assert kwargs["messages"] == messages
+        # reasoning_effort="low" is passed on every Groq call -- see
+        # GROQ_REASONING_EFFORT's own comment for why "low" specifically,
+        # confirmed supported for this exact model via both a WebSearch of
+        # Groq's own docs and direct introspection of the pinned groq
+        # package's own request-parameter type stub.
+        assert kwargs["reasoning_effort"] == GROQ_REASONING_EFFORT
 
     def test_empty_response_returns_the_documented_failure_reason(self):
+        # finish_reason defaults to "stop" (via _mock_response()'s own
+        # default) -- NOT "length" -- so this exercises the genuinely-empty
+        # path, not the truncation path below. "Genuinely empty content
+        # (regardless of finish_reason)" per the task that added this
+        # distinction: what matters is that finish_reason is NOT "length"
+        # here, mirroring a real "model returned nothing" response shape
+        # rather than a token-budget exhaustion.
         mock_client = MagicMock()
         mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response("   ")
 
@@ -553,6 +597,77 @@ class TestCallGroqInIsolation:
 
         assert text is None
         assert failure_reason == "empty response from Groq"
+
+    def test_truncated_response_with_nonempty_short_content_returns_the_distinct_truncated_reason(self):
+        # The exact live failure shape this fix addresses: finish_reason ==
+        # "length" (the token budget ran out) with a NON-empty but
+        # mid-sentence-cut-off visible answer -- reasoning consumed MOST,
+        # not ALL, of the budget. Must be classified as "truncated," a
+        # DIFFERENT failure mode from "empty response" (different root
+        # cause -- raise the token budget -- and conflating the two
+        # fallback messages made debugging this live incident harder).
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response(
+            "The 2026-02 cohort's month-5 retention is 91.", finish_reason="length"
+        )
+
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
+            )
+
+        assert text is None
+        assert failure_reason == (
+            "Groq response was truncated before completion -- try a "
+            "shorter question or increase the token budget"
+        )
+        assert failure_reason != "empty response from Groq"
+
+    def test_truncated_response_with_fully_empty_content_also_returns_the_truncated_reason(self):
+        # The OTHER live-observed shape of the same failure: reasoning
+        # consumed the ENTIRE token budget, leaving zero visible content --
+        # this is what narrate_cohort_pattern() actually hit live (150-token
+        # budget). Even though content is empty here too, finish_reason ==
+        # "length" must still win over the generic "empty response" reason --
+        # this IS the truncation failure, just a more severe case of it, not
+        # a separate "genuinely empty" case.
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.chat.completions.create.return_value = self._mock_response(
+            "", finish_reason="length"
+        )
+
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
+            )
+
+        assert text is None
+        assert "truncated" in failure_reason
+        assert failure_reason != "empty response from Groq"
+
+    def test_finish_reason_missing_from_a_test_double_does_not_raise(self):
+        # Defense-in-depth check for the getattr(..., default=None) in
+        # _call_groq() itself: a response object that doesn't set
+        # finish_reason at all (as every pre-existing mock in this codebase
+        # did before this fix) must not raise AttributeError -- it should
+        # fall through to the normal empty/success handling exactly as
+        # before. Real groq.types.chat.chat_completion.Choice objects always
+        # carry this field (confirmed via direct package introspection --
+        # it's a required, non-Optional Literal), so this is purely a
+        # test-double-safety guarantee, never a real-response code path.
+        bare_response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="A real answer."))]
+        )
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.chat.completions.create.return_value = bare_response
+
+        with patch("src.digest_engine.groq.Groq", return_value=mock_client):
+            text, failure_reason = _call_groq(
+                messages=[{"role": "user", "content": "hi"}], api_key="fake-groq-key", max_tokens=300
+            )
+
+        assert text == "A real answer."
+        assert failure_reason is None
 
     def test_package_missing_returns_the_documented_failure_reason(self):
         # Patches src.digest_engine.groq directly (the name _call_groq()

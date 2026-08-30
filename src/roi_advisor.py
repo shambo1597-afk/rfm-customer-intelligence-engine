@@ -70,6 +70,7 @@ from src.digest_engine import (
     _resolve_provider,
     _call_groq,
     _call_anthropic,
+    GROQ_REASONING_TOKEN_HEADROOM,
 )
 
 # Mirrors app.py Tab 5's own slider defaults (`value=8.5` for the conversion-
@@ -86,8 +87,16 @@ DEFAULT_GROSS_MARGIN_PCT = 40
 # Advisor answers get a bit more room than the digest's 300-token cap (a
 # recommendation that compares several segments' figures needs more than one
 # short paragraph) but stay well short of chat's 500-token cap -- this is a
-# single one-shot answer, not a back-and-forth conversation.
+# single one-shot answer, not a back-and-forth conversation. This is the
+# visible-answer target passed to Anthropic unchanged; see
+# GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS below for what's actually sent to Groq.
 ROI_ADVISOR_MAX_OUTPUT_TOKENS = 400
+# The value actually passed as max_tokens on the Groq call specifically --
+# ROI_ADVISOR_MAX_OUTPUT_TOKENS's own visible-answer target (400) is
+# unchanged; only Groq's call gets the extra reasoning headroom (see
+# GROQ_REASONING_TOKEN_HEADROOM's own comment in digest_engine.py for the
+# reasoning-token-truncation incident this fixes).
+GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS = ROI_ADVISOR_MAX_OUTPUT_TOKENS + GROQ_REASONING_TOKEN_HEADROOM
 
 _UNAVAILABLE_PREFIX = "**[Budget advisor temporarily unavailable"
 
@@ -337,7 +346,7 @@ def get_roi_recommendation(
         text, failure_reason = _call_groq(
             messages=messages,
             api_key=groq_api_key,
-            max_tokens=ROI_ADVISOR_MAX_OUTPUT_TOKENS,
+            max_tokens=GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS,
         )
     else:
         # provider == "anthropic"
