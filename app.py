@@ -52,7 +52,11 @@ from src.digest_engine import (
     get_digest_provider_override
 )
 from src.chat_context import build_account_context_blob, build_context_text
-from src.chat_engine import answer_account_question, escape_markdown_dollar_signs
+from src.chat_engine import (
+    answer_account_question,
+    escape_markdown_dollar_signs,
+    ensure_renderable_markdown_tables,
+)
 from src.roi_advisor import (
     simulate_campaign_roi,
     simulate_all_segment_allocations,
@@ -986,9 +990,23 @@ with tab2:
             # Applied to every message in this panel, not just the model's
             # answer, since a user typing a literal '$' in their own question
             # would hit the exact same bug when echoed back.
+            #
+            # ensure_renderable_markdown_tables() runs FIRST, before the
+            # dollar-sign escaping -- confirmed harmless in either order (see
+            # its own docstring's investigation note), structural repair
+            # before character-level escaping just reads more naturally.
+            # Applied at BOTH render sites below (the history replay loop AND
+            # the fresh answer), not only the fresh one: Streamlit reruns
+            # this entire script on every widget interaction, redrawing
+            # chat_conversation_history's STORED text from scratch each time
+            # -- fixing only the fresh answer's display would leave the bug
+            # reappearing the very next time the page reruns and this same
+            # turn gets replayed from session_state. The stored text itself
+            # is left as the model actually wrote it (never rewritten in
+            # place) -- only what gets displayed is repaired, every time.
             for turn in st.session_state["chat_conversation_history"]:
                 with st.chat_message(turn["role"]):
-                    st.markdown(escape_markdown_dollar_signs(turn["content"]))
+                    st.markdown(escape_markdown_dollar_signs(ensure_renderable_markdown_tables(turn["content"])))
 
             question = st.chat_input("Ask a question about this account...")
             if question:
@@ -1003,7 +1021,7 @@ with tab2:
                         provider_override=digest_provider_override,
                     )
                 with st.chat_message("assistant"):
-                    st.markdown(escape_markdown_dollar_signs(answer))
+                    st.markdown(escape_markdown_dollar_signs(ensure_renderable_markdown_tables(answer)))
                 # answer_account_question() already appended the successful turn
                 # to chat_conversation_history in place -- see its docstring. A
                 # failed turn is intentionally NOT recorded, so nothing more to

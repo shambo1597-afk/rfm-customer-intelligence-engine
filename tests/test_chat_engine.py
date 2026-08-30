@@ -28,10 +28,13 @@ from src.chat_context import build_account_context_blob, build_context_text
 from src.chat_engine import (
     answer_account_question,
     escape_markdown_dollar_signs,
+    ensure_renderable_markdown_tables,
     CHAT_MAX_OUTPUT_TOKENS,
     GROQ_CHAT_MAX_OUTPUT_TOKENS,
     CHAT_SYSTEM_PROMPT_TEMPLATE,
     _chat_unavailable,
+    _is_valid_separator_cell,
+    _split_table_row_cells,
 )
 from src.digest_engine import MODEL_ID, GROQ_MODEL_ID, GROQ_REQUEST_TIMEOUT_SECONDS
 
@@ -215,6 +218,227 @@ def _latex_bug_probe_script():
 
     raw = "Total historical value: $716,276.02 and an average P(Alive) of 10.1%"
     st.markdown(escape_markdown_dollar_signs(raw))
+
+
+def _row_is_valid_table_pair(header_line: str, separator_line: str) -> bool:
+    """
+    Test-only helper mirroring ensure_renderable_markdown_tables()'s OWN
+    validation rule exactly (same cell-splitting, same per-cell check) --
+    used below to assert a REPAIRED separator row would now pass the exact
+    rule that rejected it before, not just that "something changed."
+    """
+    header_cells = _split_table_row_cells(header_line)
+    separator_cells = _split_table_row_cells(separator_line)
+    return len(separator_cells) == len(header_cells) and all(
+        _is_valid_separator_cell(c) for c in separator_cells
+    )
+
+
+class TestEnsureRenderableMarkdownTablesFixValidTablePassesThrough:
+    """
+    Regression coverage for the malformed-markdown-table bug: a Chat Q&A
+    answer with a genuinely valid 5-row table rendered as only its header
+    row in Streamlit, with the rest of the table gone from what a person
+    sees (confirmed via a real screenshot). Root cause and the confirmed
+    parsing rules are documented in ensure_renderable_markdown_tables()'s
+    own docstring/investigation note.
+    """
+
+    def test_valid_table_is_returned_completely_unchanged(self):
+        valid = (
+            "Here are the top items:\n\n"
+            "| Customer | Action |\n"
+            "|---|---|\n"
+            "| CUST-01 | Call now |\n"
+            "| CUST-02 | Send email |\n"
+        )
+        # Exact string equality, per the task's explicit requirement -- not
+        # just "looks the same," the SAME string object/content byte-for-byte.
+        assert ensure_renderable_markdown_tables(valid) == valid
+
+    def test_valid_table_with_alignment_markers_is_untouched(self):
+        valid = "| A | B |\n|:---:|---:|\n| 1 | 2 |\n"
+        assert ensure_renderable_markdown_tables(valid) == valid
+
+    def test_text_with_no_table_at_all_is_untouched(self):
+        plain = "This account has 450 customers across 7 segments.\n"
+        assert ensure_renderable_markdown_tables(plain) == plain
+
+    def test_two_lines_that_merely_both_contain_pipes_are_not_forced_into_a_table(self):
+        # A false-positive guard: ordinary prose that happens to contain a
+        # '|' character must never be reinterpreted as an attempted table --
+        # the second line here has no cell that's a valid delimiter cell.
+        prose = "Some prose.\n\nRandom text with a | pipe in it\nAnd more prose after, no dash.\n"
+        assert ensure_renderable_markdown_tables(prose) == prose
+
+
+class TestEnsureRenderableMarkdownTablesRepairsMalformedTables:
+    """
+    Fixtures constructed from the confirmed rules (investigation note in
+    src/chat_engine.py): a header/delimiter column-count mismatch, and a
+    stray character inside an otherwise-valid delimiter cell, BOTH
+    empirically confirmed (via the real remark-gfm reference parser this
+    project's Streamlit is built on) to make the whole table fall back to
+    literal text -- exactly the live bug's mechanism.
+    """
+
+    def test_mismatched_column_count_is_repaired_to_match_the_header(self):
+        malformed = (
+            "Some intro text.\n\n"
+            "| Name | Value | Extra |\n"
+            "|---|---|\n"
+            "| A | 1 | x |\n"
+        )
+        repaired = ensure_renderable_markdown_tables(malformed)
+        assert repaired != malformed
+        # The header and every data row's cell content is preserved verbatim.
+        assert "| Name | Value | Extra |" in repaired
+        assert "| A | 1 | x |" in repaired
+        header_line = "| Name | Value | Extra |"
+        separator_line = [l for l in repaired.splitlines() if l.strip() and "-" in l and set(l.strip()) <= set("|-: ")][0]
+        assert _row_is_valid_table_pair(header_line, separator_line)
+
+    def test_stray_character_in_one_delimiter_cell_is_repaired(self):
+        malformed = "Some intro text.\n\n| Name | Value |\n|-x-|---|\n| A | 1 |\n"
+        repaired = ensure_renderable_markdown_tables(malformed)
+        assert repaired != malformed
+        assert "| Name | Value |" in repaired
+        assert "| A | 1 |" in repaired
+        separator_line = [l for l in repaired.splitlines() if l.strip() and "-" in l and set(l.strip()) <= set("|-: ")][0]
+        assert _row_is_valid_table_pair("| Name | Value |", separator_line)
+        # The stray 'x' itself must be gone from the repaired separator --
+        # confirms this is an actual fix, not a no-op that left it in place.
+        assert "x" not in separator_line
+
+    def test_repair_preserves_alignment_markers_on_cells_that_were_already_valid(self):
+        # Only the genuinely-invalid cell ("bogus") should be replaced;
+        # the two already-valid, differently-aligned cells either side of
+        # it must survive the repair untouched.
+        malformed = "| A | B | C |\n|:---|bogus|--:|\n| 1 | 2 | 3 |\n"
+        repaired = ensure_renderable_markdown_tables(malformed)
+        assert "| :--- | --- | --: |" in repaired
+        assert "bogus" not in repaired
+
+    def test_degenerate_single_cell_header_falls_back_to_a_bulleted_list_not_a_forced_table(self):
+        # A "header" with fewer than 2 real columns isn't a genuine table --
+        # per the task's "do not attempt a content-inventing repair" rule,
+        # this is reformatted as bullets instead of forcing table semantics
+        # onto content that was never really tabular.
+        degenerate = "| Summary |\n|---|\nA lone follow-up line.\n\nAfter.\n"
+        result = ensure_renderable_markdown_tables(degenerate)
+        assert result != degenerate
+        assert "|" not in result.split("\n\n")[0]  # the reformatted block has no pipe-table syntax left
+        # No content lost: every original cell's text still appears somewhere.
+        assert "Summary" in result
+
+    @pytest.mark.parametrize("malformed_line", [
+        "| Name | Value | Extra |",  # paired with a 2-cell separator below
+    ])
+    def test_repaired_output_actually_becomes_parseable_by_the_same_rule_multiple_shapes(self, malformed_line):
+        # Broader sweep: several independently-constructed malformed shapes,
+        # each asserted to pass the SAME validation rule after repair.
+        cases = [
+            ("| A | B |\n|---|\n| 1 | 2 |\n", 2),          # separator has fewer cells than header
+            ("| A | B | C |\n|---|---|---|---|\n| 1 | 2 | 3 |\n", 3),  # separator has MORE cells than header
+        ]
+        for text, header_cell_count in cases:
+            repaired = ensure_renderable_markdown_tables(text)
+            lines = repaired.splitlines()
+            header_line, separator_line = lines[0], lines[1]
+            assert len(_split_table_row_cells(header_line)) == header_cell_count
+            assert _row_is_valid_table_pair(header_line, separator_line)
+
+
+class TestEnsureRenderableMarkdownTablesBlankLineFindings:
+    """
+    The investigation's two, DIFFERENT, empirically-confirmed findings about
+    blank-line placement -- documented explicitly so future work doesn't
+    re-investigate the disproven half:
+    - Missing blank line BEFORE a table does NOT cause a parse failure (GFM
+      tables may interrupt a paragraph directly) -- this hypothesis was
+      checked and found FALSE, confirmed against the real remark-gfm parser.
+    - Missing blank line AFTER a table DOES cause a real, different defect:
+      the next non-blank, no-pipe line gets silently absorbed as a spurious
+      extra table row -- confirmed against the real parser -- which is its
+      own way of making part of an answer effectively vanish from view.
+    """
+
+    def test_no_blank_line_before_a_valid_table_is_not_treated_as_a_defect(self):
+        # Structurally similar to the real live failure's shape: a table
+        # immediately following bolded prose with no blank line separator,
+        # the way a natural LLM response is actually formatted.
+        text = "**Top priorities this week:**\n| Customer | Action |\n|---|---|\n| CUST-01 | Call now |\n"
+        assert ensure_renderable_markdown_tables(text) == text
+
+    def test_missing_blank_line_after_a_table_gets_one_inserted(self):
+        text = "| A | B |\n|---|---|\n| 1 | 2 |\nMore text right after, no blank line.\n"
+        result = ensure_renderable_markdown_tables(text)
+        assert result != text
+        assert "| 1 | 2 |\n\nMore text right after, no blank line.\n" in result
+        # The table's own rows are byte-identical -- only spacing was added.
+        assert "| A | B |\n|---|---|\n| 1 | 2 |" in result
+
+    def test_table_already_followed_by_a_blank_line_is_untouched(self):
+        text = "| A | B |\n|---|---|\n| 1 | 2 |\n\nAlready properly spaced.\n"
+        assert ensure_renderable_markdown_tables(text) == text
+
+    def test_table_at_the_very_end_of_the_answer_needs_no_trailing_blank_line(self):
+        text = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+        assert ensure_renderable_markdown_tables(text) == text
+
+
+class TestEnsureRenderableMarkdownTablesComposesWithDollarEscaping:
+    """
+    Confirms the two rendering-safety-net functions compose correctly in
+    the order documented in both docstrings (tables repaired first, dollar
+    signs escaped second) -- a single answer containing BOTH a dollar amount
+    inside a VALID table cell AND a structurally invalid table elsewhere
+    must have both issues correctly handled after both functions run, in
+    either call order (confirmed independent -- see the investigation note).
+    """
+
+    def _answer(self):
+        return (
+            "Here is the pricing breakdown:\n\n"
+            "| Item | Price |\n"
+            "|---|---|\n"
+            "| Widget | $19.99 |\n\n"
+            "And here are the action items:\n"
+            "| Name | Value | Extra |\n"
+            "|---|---|\n"
+            "| A | 1 | x |\n"
+        )
+
+    def test_documented_order_tables_then_dollars_fixes_both_issues(self):
+        answer = self._answer()
+        result = escape_markdown_dollar_signs(ensure_renderable_markdown_tables(answer))
+        # Dollar sign escaped.
+        assert "\\$19.99" in result
+        assert re.search(r"(?<!\\)\$", result) is None
+        # Malformed table repaired -- 3-column header now paired with a
+        # 3-column separator.
+        assert "| Name | Value | Extra |" in result
+        assert "| --- | --- | --- |" in result
+        # Valid table's own content untouched (aside from the dollar escape).
+        assert "| Widget | \\$19.99 |" in result
+
+    def test_reverse_order_dollars_then_tables_also_fixes_both_issues(self):
+        # Confirms order is truly immaterial to correctness, not just
+        # "the documented order happens to work."
+        answer = self._answer()
+        result = ensure_renderable_markdown_tables(escape_markdown_dollar_signs(answer))
+        assert "\\$19.99" in result
+        assert re.search(r"(?<!\\)\$", result) is None
+        assert "| Name | Value | Extra |" in result
+        assert "| --- | --- | --- |" in result
+        assert "| Widget | \\$19.99 |" in result
+
+    def test_both_orders_produce_identical_output(self):
+        # The strongest form of the "order is immaterial" claim.
+        answer = self._answer()
+        forward = escape_markdown_dollar_signs(ensure_renderable_markdown_tables(answer))
+        backward = ensure_renderable_markdown_tables(escape_markdown_dollar_signs(answer))
+        assert forward == backward
 
 
 class TestFallbackPathNoKeys:

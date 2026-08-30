@@ -107,6 +107,8 @@ per-session cost tracking was explicitly out of scope for this feature (see
 the task that introduced this module).
 """
 
+import re
+
 from src.digest_engine import (
     anthropic,
     groq,
@@ -186,6 +188,245 @@ def escape_markdown_dollar_signs(text: str) -> str:
     risk-reduction measure only.
     """
     return text.replace("$", "\\$")
+
+
+# --- Malformed markdown table safety net -----------------------------------
+#
+# Bug found via live testing (screenshot evidence): a Chat Q&A answer asking
+# for 5 actionable items returned a complete, correct 5-row markdown table
+# from the LLM (confirmed by reproducing the same question against the live
+# API and inspecting the raw response text -- the model's own output was
+# correct), but the Streamlit UI rendered only the header row as literal
+# pipe-delimited text, with the rest of the table effectively gone from what
+# a person sees. This is NOT reliably reproducible on demand -- the exact
+# malformed shape varies run to run -- so the fix below is a general,
+# testable safety net over ANY table shape, not a patch aimed at one
+# specific observed table.
+#
+# Investigation (same standard of rigor as escape_markdown_dollar_signs()
+# above -- read the actual parsing code, don't assume from documentation):
+#
+# 1. Streamlit's bundled JS (streamlit/static/static/js/StreamlitMarkdown.
+#    *.js) embeds micromark-extension-gfm-table's real tokenizer -- located
+#    by searching that bundle directly for the `gfmTable` string, which leads
+#    straight to the unminified-in-spirit (just short variable names, intact
+#    control flow and string literals like `tableDelimiterRow`,
+#    `tableDelimiterMarker`) tokenizer source. Reading it directly confirms:
+#      - A table's delimiter (separator) row may contain ONLY '|', '-', ':',
+#        and whitespace (character codes 45 and 58 are the only two accepted
+#        inside a delimiter cell besides the pipe divider and whitespace) --
+#        any other character there is an immediate parse failure for the
+#        WHOLE table construct, not just that row.
+#      - The tokenizer tracks a cell count for the header row and a separate
+#        cell count for the delimiter row, and explicitly checks they are
+#        EQUAL before accepting the table (`i!==a` in the minified source
+#        causes the fallback path) -- a header/delimiter column-count
+#        mismatch is a second, independent parse-failure trigger.
+# 2. Empirically re-confirmed against the actual reference implementation
+#    this bundle is built from (`remark-gfm`, run directly via Node in this
+#    session -- not assumed): a header/delimiter column-count mismatch, or a
+#    stray non-'-'/':' character in the delimiter row, both cause the ENTIRE
+#    block (header line, delimiter line, and every following row) to
+#    collapse into ONE plain-text paragraph -- confirmed by rendering to
+#    actual HTML and inspecting the output, not just the parsed node type.
+#    Conversely: a MISSING BLANK LINE BEFORE a table does NOT cause a parse
+#    failure -- GFM tables are one of the few block types allowed to
+#    interrupt a paragraph directly, confirmed by parsing a table placed
+#    immediately after prose with zero blank lines and observing a normal
+#    `table` node every time. This directly REFUTES that specific hypothesis
+#    (worth stating plainly so it isn't re-investigated later) -- but testing
+#    also surfaced a DIFFERENT, real, confirmed defect in the same family: a
+#    MISSING BLANK LINE **AFTER** a table causes the very next non-blank
+#    line -- even one containing no '|' at all -- to be silently absorbed as
+#    a spurious extra table row, which is its own way of making an answer's
+#    trailing sentence effectively vanish from the reader's view. Both
+#    confirmed defects are handled below; data-row cell-count irregularities
+#    (a row with fewer/more cells than the header) were also tested and
+#    confirmed harmless -- GFM tables tolerate that gracefully on their own
+#    (missing cells render empty, extra cells are dropped), so this function
+#    does not attempt to "fix" that non-issue.
+# 3. Composition order with escape_markdown_dollar_signs(): confirmed, not
+#    assumed, that the two never interact. A delimiter row can never contain
+#    '$' (any non-'-'/':' character there already fails validation on its
+#    own, independent of dollar signs), and escaping '$' -> '\$' inside a
+#    HEADER/data cell is a pure character-for-character substitution that
+#    never inserts or removes a '|' -- so it cannot change any cell count or
+#    separator validity. Verified directly (not just reasoned about): a table
+#    with a '$' in a header cell parses identically, cell-count and all,
+#    before and after escaping. Since order is provably immaterial to
+#    correctness, this module applies ensure_renderable_markdown_tables()
+#    FIRST and escape_markdown_dollar_signs() SECOND at the app.py call site
+#    -- structural repair before character-level escaping reads more
+#    naturally, but either order is equally correct.
+
+# A GFM delimiter cell: optional leading ':', one or more '-', optional
+# trailing ':' -- exactly what the tokenizer investigated above accepts.
+_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-+:?$")
+
+
+def _split_table_row_cells(line: str) -> list:
+    """
+    Splits one markdown table row into its cell strings, mirroring the exact
+    GFM convention confirmed above: strip surrounding whitespace, drop one
+    optional leading '|' and one optional trailing '|', then split what's
+    left on '|' characters that are NOT escaped with a backslash (the same
+    tokenizer treats '\\|' as literal cell content, never a cell boundary).
+    """
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|") and not stripped.endswith("\\|"):
+        stripped = stripped[:-1]
+    return re.split(r"(?<!\\)\|", stripped)
+
+
+def _is_valid_separator_cell(cell: str) -> bool:
+    """One GFM delimiter cell -- see _TABLE_SEPARATOR_CELL_RE's comment."""
+    return bool(_TABLE_SEPARATOR_CELL_RE.match(cell.strip()))
+
+
+def _looks_like_attempted_table_separator(line: str) -> bool:
+    """
+    True if `line` is plausibly an ATTEMPTED GFM delimiter row: at least one
+    of its pipe-delimited cells is ALREADY a fully valid delimiter cell
+    (":---", "---", "---:", etc.) -- a strong, unambiguous signal someone was
+    writing a dash-based separator in at least that one column, whatever
+    shape the REST of the row is in. Deliberately a per-cell check, not a
+    whole-line character-class or ratio check: the investigation above
+    confirmed two DIFFERENT ways a real delimiter row goes wrong (a
+    whole-row column-count mismatch, and a single stray character inside one
+    otherwise-valid cell) -- a per-cell "at least one cell is clean" check
+    correctly recognizes both as attempted separators (there's a real,
+    valid-looking cell to anchor on) while still never misfiring on ordinary
+    prose, where a pipe-delimited "cell" being ENTIRELY dashes/colons is
+    essentially never accidental.
+    """
+    return any(_is_valid_separator_cell(cell) for cell in _split_table_row_cells(line))
+
+
+def _rebuild_separator_row(header_cell_count: int, original_cells: list) -> str:
+    """
+    Regenerates a delimiter row with EXACTLY header_cell_count cells. This is
+    always a purely STRUCTURAL fix, never a content-inventing one: a GFM
+    delimiter row carries zero semantic information (see the investigation
+    note above) -- only the header row's and data rows' cell text carry
+    meaning, and neither is ever touched by this function. Alignment colons
+    are preserved wherever the ORIGINAL cell at that position was already a
+    valid delimiter cell (":--", "--:", ":-:"); only genuinely invalid or
+    missing cells fall back to a plain, unaligned "---".
+    """
+    cells = []
+    for idx in range(header_cell_count):
+        original = original_cells[idx].strip() if idx < len(original_cells) else ""
+        cells.append(original if _is_valid_separator_cell(original) else "---")
+    return "| " + " | ".join(cells) + " |"
+
+
+def _table_block_to_bullets(content_lines: list) -> list:
+    """
+    Reformats a degenerate/unrepairable "table" block into a bulleted list --
+    one bullet per line, cells joined with an em dash so multi-cell content
+    still reads sensibly. Every original cell's text is preserved verbatim
+    (only the pipe-table punctuation and the now-meaningless delimiter row
+    are dropped) -- this is the "don't invent content, just re-present it"
+    fallback the module docstring above describes, used only for the one
+    case a structural repair can't confidently apply: a "header" line that,
+    once cell-split, doesn't actually have a second column to speak of.
+    """
+    bullets = []
+    for content_line in content_lines:
+        cells = [c.strip() for c in _split_table_row_cells(content_line) if c.strip()]
+        if cells:
+            bullets.append("- " + " — ".join(cells))
+    return bullets
+
+
+def ensure_renderable_markdown_tables(text: str) -> str:
+    """
+    Scans `text` for markdown table blocks that Streamlit's renderer would
+    fail to render as an actual table (see the investigation note above for
+    the exact, confirmed rules), and repairs or reformats each one so the
+    answer's full content always reaches the reader -- never silently
+    truncated the way the live bug this function fixes was.
+
+    For each candidate block (a line containing '|' immediately followed by
+    a line that looks like an attempted GFM delimiter row):
+    - A header with fewer than 2 real cells isn't a genuine table at all --
+      reformatted as a bulleted list (see _table_block_to_bullets()) rather
+      than forcing table semantics onto content that was never really
+      tabular, or guessing at a structure the model didn't clearly provide.
+    - Otherwise, if the delimiter row's cell count doesn't match the
+      header's, or any of its cells are invalid, it is mechanically
+      regenerated to match the header's column count exactly (see
+      _rebuild_separator_row() -- always safe, since a delimiter row carries
+      no semantic content to lose or invent).
+    - Either way, if the line immediately following the table's data rows is
+      non-blank and contains no '|' (i.e. it looks like prose that would
+      otherwise be silently absorbed as a spurious extra row -- the second
+      confirmed defect above), exactly one blank line is inserted before it.
+
+    A block that is ALREADY fully valid AND already properly spaced is left
+    completely untouched -- if nothing anywhere in `text` needed a change,
+    this function returns the exact same string object, byte-for-byte.
+
+    This function does not, and should not, need to understand the SEMANTIC
+    content of any cell -- every decision it makes is purely structural
+    (character classes and cell counts), which is what keeps it general
+    across arbitrary table shapes rather than tied to one observed example.
+    """
+    lines = text.split("\n")
+    n = len(lines)
+    out = []
+    changed = False
+    i = 0
+    while i < n:
+        line = lines[i]
+        if "|" in line and i + 1 < n and _looks_like_attempted_table_separator(lines[i + 1]):
+            header_cells = _split_table_row_cells(line)
+            separator_line = lines[i + 1]
+            separator_cells = _split_table_row_cells(separator_line)
+
+            # Extent of this table block, matching how the real renderer
+            # itself groups rows (confirmed via the investigation above):
+            # every contiguous non-blank line containing '|' after the
+            # delimiter row belongs to this SAME table, regardless of its
+            # own cell count -- data-row cell-count irregularities are
+            # already handled gracefully by the renderer, not something
+            # this function needs to fix. A non-blank line with NO '|' ends
+            # the block instead of joining it (see the module docstring's
+            # "missing blank line after" defect).
+            j = i + 2
+            while j < n and lines[j].strip() != "" and "|" in lines[j]:
+                j += 1
+            data_lines = lines[i + 2:j]
+            trailing_prose_follows = j < n and lines[j].strip() != ""
+
+            if len(header_cells) < 2:
+                out.extend(_table_block_to_bullets([line] + data_lines))
+                changed = True
+            else:
+                already_valid = (
+                    len(separator_cells) == len(header_cells)
+                    and all(_is_valid_separator_cell(c) for c in separator_cells)
+                )
+                out.append(line)
+                if already_valid:
+                    out.append(separator_line)
+                else:
+                    out.append(_rebuild_separator_row(len(header_cells), separator_cells))
+                    changed = True
+                out.extend(data_lines)
+
+            if trailing_prose_follows:
+                out.append("")
+                changed = True
+
+            i = j
+        else:
+            out.append(line)
+            i += 1
+
+    return "\n".join(out) if changed else text
 
 
 CHAT_SYSTEM_PROMPT_TEMPLATE = (
