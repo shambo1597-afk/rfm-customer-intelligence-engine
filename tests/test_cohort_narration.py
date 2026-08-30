@@ -20,7 +20,11 @@ import pandas as pd
 import pytest
 
 from src.cohort_engine import find_notable_cohort_pattern, NOTABLE_COHORT_MIN_COLUMN_SAMPLES
-from src.cohort_narration import narrate_cohort_pattern, COHORT_NARRATION_MAX_OUTPUT_TOKENS
+from src.cohort_narration import (
+    narrate_cohort_pattern,
+    COHORT_NARRATION_MAX_OUTPUT_TOKENS,
+    GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS,
+)
 
 
 def _make_groq_api_error(status_code: int, message: str = "error"):
@@ -244,7 +248,13 @@ class TestSuccessfulCalls:
         assert "5.0%" in prompt
         assert "50.5%" in prompt
         assert "Do not invent any numbers" in prompt
-        assert kwargs["max_tokens"] == COHORT_NARRATION_MAX_OUTPUT_TOKENS
+        # The Groq call gets COHORT_NARRATION_MAX_OUTPUT_TOKENS PLUS
+        # reasoning headroom (GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS), not
+        # the bare visible-answer target -- see
+        # GROQ_REASONING_TOKEN_HEADROOM's comment in digest_engine.py. This
+        # is literally the constant whose original, headroom-free value
+        # (150) caused the live truncation bug this fix addresses.
+        assert kwargs["max_tokens"] == GROQ_COHORT_NARRATION_MAX_OUTPUT_TOKENS
 
     def test_successful_anthropic_call_returns_model_text(self, sample_pattern):
         block = types.SimpleNamespace(type="text", text="A notable drop was found.")
@@ -256,6 +266,22 @@ class TestSuccessfulCalls:
             result = narrate_cohort_pattern(sample_pattern, anthropic_api_key="sk-ant-fake-key")
 
         assert result == "A notable drop was found."
+
+    def test_anthropic_call_uses_the_unmodified_visible_answer_target(self, sample_pattern):
+        # Regression guard: Claude Haiku is not a reasoning model and was
+        # never at risk of this bug -- its call must keep using the
+        # original, un-inflated COHORT_NARRATION_MAX_OUTPUT_TOKENS, not the
+        # Groq-specific headroom-added constant.
+        block = types.SimpleNamespace(type="text", text="An explanation.")
+        mock_response = types.SimpleNamespace(content=[block])
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = mock_response
+
+        with patch("src.cohort_narration.anthropic.Anthropic", return_value=mock_client):
+            narrate_cohort_pattern(sample_pattern, anthropic_api_key="sk-ant-fake-key")
+
+        _, kwargs = mock_client.with_options.return_value.messages.create.call_args
+        assert kwargs["max_tokens"] == COHORT_NARRATION_MAX_OUTPUT_TOKENS
 
 
 class TestFailuresDegradeGracefully:

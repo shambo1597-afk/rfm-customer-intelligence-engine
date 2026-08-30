@@ -24,6 +24,7 @@ from src.roi_advisor import (
     DEFAULT_CONV_RATE_PCT,
     DEFAULT_GROSS_MARGIN_PCT,
     ROI_ADVISOR_MAX_OUTPUT_TOKENS,
+    GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS,
 )
 
 
@@ -308,7 +309,11 @@ class TestSuccessfulCalls:
             get_roi_recommendation("A question.", allocations_df, 1000.0, groq_api_key="fake-groq-key")
 
         _, kwargs = mock_client.with_options.return_value.chat.completions.create.call_args
-        assert kwargs["max_tokens"] == ROI_ADVISOR_MAX_OUTPUT_TOKENS
+        # The Groq call gets ROI_ADVISOR_MAX_OUTPUT_TOKENS PLUS reasoning
+        # headroom (GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS), not the bare
+        # visible-answer target -- see GROQ_REASONING_TOKEN_HEADROOM's
+        # comment in digest_engine.py.
+        assert kwargs["max_tokens"] == GROQ_ROI_ADVISOR_MAX_OUTPUT_TOKENS
 
     def test_successful_anthropic_call_returns_model_text(self, two_segment_fixture):
         rfmt_df, clv_df = two_segment_fixture
@@ -325,6 +330,26 @@ class TestSuccessfulCalls:
             )
 
         assert result == "Prioritize Champions."
+
+    def test_anthropic_call_uses_the_unmodified_visible_answer_target(self, two_segment_fixture):
+        # Regression guard: Claude Haiku is not a reasoning model and was
+        # never at risk of the reasoning-token-truncation bug -- its call
+        # must keep using the original, un-inflated
+        # ROI_ADVISOR_MAX_OUTPUT_TOKENS, not the Groq-specific
+        # headroom-added constant.
+        rfmt_df, clv_df = two_segment_fixture
+        allocations_df = simulate_all_segment_allocations(rfmt_df, clv_df, total_budget=1000.0)
+
+        block = types.SimpleNamespace(type="text", text="A recommendation.")
+        mock_response = types.SimpleNamespace(content=[block])
+        mock_client = MagicMock()
+        mock_client.with_options.return_value.messages.create.return_value = mock_response
+
+        with patch("src.roi_advisor.anthropic.Anthropic", return_value=mock_client):
+            get_roi_recommendation("A question.", allocations_df, 1000.0, anthropic_api_key="sk-ant-fake-key")
+
+        _, kwargs = mock_client.with_options.return_value.messages.create.call_args
+        assert kwargs["max_tokens"] == ROI_ADVISOR_MAX_OUTPUT_TOKENS
 
 
 class TestFailuresDegradeGracefully:

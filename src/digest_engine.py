@@ -112,6 +112,21 @@ Groq (default, GROQ_MODEL_ID below): openai/gpt-oss-120b.
   volume (8 accounts * 1 digest call/day = 8 calls/day), none of these are a
   meaningfully binding constraint.
 
+  Reasoning-token headroom, 2026-08-29 (see GROQ_REASONING_TOKEN_HEADROOM's
+  own comment below for the full incident and rationale): raising each
+  feature's *_MAX_OUTPUT_TOKENS constant raises the worst-case token ceiling
+  per call, not the typical actual usage -- Groq bills/quotas by tokens
+  ACTUALLY generated, and GROQ_REASONING_EFFORT="low" is specifically chosen
+  to keep real reasoning usage well under the new, larger ceiling for these
+  short, simple prompts. The honest risk this doesn't fully rule out (flagged
+  explicitly, not glossed over): a reasoning model given more room CAN, in
+  rare cases, choose to reason longer rather than stopping early, so a larger
+  ceiling is not a strict no-op on typical cost/latency the way it would be
+  for a non-reasoning model. This could not be empirically verified against a
+  real key in this environment (see the same constant's comment) -- if a real
+  deployment sees materially higher latency or token-quota pressure after
+  this change, that is the first thing to re-measure.
+
   DATA-USAGE DISCLOSURE: per WebSearch-sourced summaries of Groq's own
   documentation (again, not independently fetched -- see the verification
   caveat above), Groq does NOT use customer inputs/outputs to train or
@@ -198,10 +213,87 @@ REQUEST_TIMEOUT_SECONDS = 20.0
 # risk that caused both the Gemini incident and this immediate substitution --
 # periodically re-verify regardless.
 GROQ_MODEL_ID = "openai/gpt-oss-120b"
+
+# --- Reasoning-token headroom, 2026-08-29 (read before changing any of the
+# four *_MAX_OUTPUT_TOKENS constants below or removing GROQ_REASONING_EFFORT) ---
+#
+# openai/gpt-oss-120b is a REASONING model: before producing the visible
+# answer, it generates a hidden chain-of-thought (returned in the response
+# message's own `reasoning` field, confirmed via direct introspection of the
+# installed groq package's type stubs -- groq/types/chat/chat_completion_
+# message.py) that is billed against, and truncated by, the SAME max_tokens
+# budget as the visible content. Live testing found this: with the digest's
+# 300-token budget applied to a cohort-narration call (150 tokens at the
+# time), the reasoning text alone consumed nearly the entire budget, leaving
+# either an empty or mid-sentence-truncated visible answer -- confirmed via
+# finish_reason == "length" on the raw response. This is a structural risk
+# for EVERY one-shot Groq call in this codebase, not just cohort narration --
+# every one of generate_account_digest(), answer_account_question(),
+# get_roi_recommendation(), and narrate_cohort_pattern() calls the same
+# shared _call_groq() below and was equally exposed; each one's own
+# *_MAX_OUTPUT_TOKENS constant (GROQ_MAX_OUTPUT_TOKENS here,
+# CHAT_MAX_OUTPUT_TOKENS in chat_engine.py, ROI_ADVISOR_MAX_OUTPUT_TOKENS in
+# roi_advisor.py, COHORT_NARRATION_MAX_OUTPUT_TOKENS in cohort_narration.py)
+# is a SEPARATE constant, not literally one shared value the way the task
+# that surfaced this bug initially assumed -- verified by reading all four
+# files directly, not assumed. Each one is now defined as its own original
+# visible-content target PLUS this shared GROQ_REASONING_TOKEN_HEADROOM, so
+# the "how much extra room does reasoning need" number lives in exactly one
+# place, reused by all four, while each feature's own visible-length intent
+# stays legible at its own definition site.
+#
+# GROQ_REASONING_TOKEN_HEADROOM's value, honestly: this environment's network
+# egress policy blocks console.groq.com and api.groq.com outright (the same
+# restriction noted throughout this file's Groq-related sourcing caveats),
+# and no GROQ_API_KEY is available here either -- so the empirical
+# methodology this fix was supposed to follow (reproduce this project's real
+# prompts against the raw SDK with a generous ceiling, inspect finish_reason
+# and actual token usage, pick a value with headroom above the largest
+# OBSERVED combined reasoning+visible usage) could not be carried out. 1500
+# is a reasoned, deliberately generous estimate instead, informed by: (a) the
+# live failure above, where a 150-token budget was insufficient by a wide
+# margin; (b) OpenAI's own gpt-oss-120b/20b model card, which states
+# reasoning-token counts "can vary from hundreds to tens of thousands
+# depending on task complexity" (sourced via WebSearch -- console.groq.com/
+# huggingface.co were not directly fetchable from this environment either);
+# and (c) GROQ_REASONING_EFFORT below, set to "low" specifically to keep
+# actual reasoning usage toward the low end of that range for these
+# genuinely simple, short, single-purpose prompts (a one-paragraph digest, a
+# short Q&A answer, a budget recommendation over a small table, a one-to-two
+# sentence narration -- none of which need "deep and detailed analysis").
+# This is NOT a substitute for the real empirical verification the task
+# asked for -- re-run that exact methodology against a real key outside this
+# environment's network restrictions, inspect the real finish_reason/usage
+# numbers it reports, and tune this constant down (or up) from 1500 once
+# real data exists, rather than trusting this estimate indefinitely.
+GROQ_REASONING_TOKEN_HEADROOM = 1500
+
+# 'low', 'medium' (Groq's own default), or 'high' -- confirmed supported for
+# specifically openai/gpt-oss-20b and openai/gpt-oss-120b via WebSearch of
+# Groq's own docs (console.groq.com/docs/reasoning was not directly
+# fetchable -- see the sourcing caveat above) AND, independently, via direct
+# introspection of the installed groq package's own request-parameter type
+# stub (groq/types/chat/completion_create_params.py), whose reasoning_effort
+# docstring names openai/gpt-oss-120b explicitly as supporting these three
+# values -- not assumed from either source alone. Set to "low" ("fast
+# responses... best for straightforward questions" per Groq's own
+# documentation) rather than the "medium" default specifically so actual
+# reasoning-token usage stays toward the low end of the range
+# GROQ_REASONING_TOKEN_HEADROOM budgets for -- every prompt this codebase
+# sends via Groq is a short, single-purpose business-text task, never a
+# multi-step problem that would benefit from "high"'s deeper analysis.
+GROQ_REASONING_EFFORT = "low"
+
 # Mirrors MAX_TOKENS's role for Anthropic: short paragraph only, bounds
-# worst-case cost. Passed as max_tokens on the chat.completions.create() call
-# below (OpenAI-compatible API shape).
-GROQ_MAX_OUTPUT_TOKENS = 300
+# worst-case cost, PLUS GROQ_REASONING_TOKEN_HEADROOM above for this
+# reasoning model's hidden chain-of-thought (see that constant's comment for
+# the full rationale and its honesty caveat about not being empirically
+# verified in this environment). Passed as max_tokens on the
+# chat.completions.create() call below (OpenAI-compatible API shape). Was
+# 300 (visible-content-only) before this fix; the actual visible-content
+# target is still ~300 tokens, unchanged -- only the reasoning headroom is
+# new.
+GROQ_MAX_OUTPUT_TOKENS = 300 + GROQ_REASONING_TOKEN_HEADROOM
 # Outer safety-net timeout for client.chat.completions.create() -- passed via
 # client.with_options(timeout=...) below, mirroring REQUEST_TIMEOUT_SECONDS's
 # Anthropic mechanism exactly (both SDKs support the same with_options()
@@ -418,8 +510,22 @@ def _call_groq(
     Returns a (response_text, failure_reason) tuple: (text, None) on success,
     (None, reason) on failure -- `reason` is one of "Groq free-tier rate
     limit reached", "invalid Groq API key", "Groq API request timed out",
-    "Groq API error", "empty response from Groq", "groq package not
-    installed", or "unexpected error calling Groq".
+    "Groq API error", "empty response from Groq", "Groq response was
+    truncated before completion -- try a shorter question or increase the
+    token budget", "groq package not installed", or "unexpected error
+    calling Groq".
+
+    The "truncated" reason (see GROQ_REASONING_TOKEN_HEADROOM's comment
+    above for the underlying cause) is checked BEFORE the "empty" one and
+    wins whenever the API itself reports finish_reason == "length" -- this
+    single check covers both observed shapes of the same underlying failure:
+    reasoning consuming the ENTIRE token budget (visible content ends up
+    empty) and reasoning consuming MOST of it (visible content is short and
+    cut off mid-sentence). Conflating either of those with a genuinely empty
+    response (e.g. finish_reason == "stop" with no content for some other
+    reason) would misdirect a future debugging session toward "something is
+    fundamentally broken" instead of "raise the token budget" -- exactly
+    what happened live before this fix existed.
 
     Never raises -- both callers still guarantee "this optional feature never
     crashes the app" by construction (every exception the SDK is documented,
@@ -445,8 +551,21 @@ def _call_groq(
         response = client.with_options(timeout=GROQ_REQUEST_TIMEOUT_SECONDS).chat.completions.create(
             model=GROQ_MODEL_ID,
             max_tokens=max_tokens,
+            reasoning_effort=GROQ_REASONING_EFFORT,
             messages=messages,
         )
+        # getattr(..., default=None), not direct attribute access: the real
+        # groq.types.chat.chat_completion.Choice model always carries this
+        # field (confirmed via direct package introspection -- it's a
+        # required, non-Optional Literal["stop", "length", "tool_calls",
+        # "function_call"]), so this default is purely defensive against a
+        # test double that doesn't set it, never a real-response fallback.
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        if finish_reason == "length":
+            return None, (
+                "Groq response was truncated before completion -- try a "
+                "shorter question or increase the token budget"
+            )
         text = (response.choices[0].message.content or "").strip()
         if not text:
             return None, "empty response from Groq"
